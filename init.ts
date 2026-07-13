@@ -35,10 +35,12 @@
 	// Plain shell under the editor (defaults to the user's shell).
 	// New terminal splits hang off the most recent split, so refocus the
 	// editor pane first to make the horizontal split land under it.
+	// ratio applies to the ORIGINAL (top) split: 0.75 = editor keeps 75%,
+	// the shell below gets 25%.
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 	const shell = await editor.createTerminal({
 		direction: "horizontal",
-		ratio: 0.25,
+		ratio: 0.75,
 		focus: false,
 	});
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
@@ -51,9 +53,11 @@
 	// watcher can never see its own queue writes and loop.
 	const queue = `/tmp/fresh-open-queue-${Date.now()}`;
 	editor.writeFile(queue, "");
+	// Foreground, output visible — the shell doubles as the watcher log;
+	// open another terminal (+ on the tab bar) for shell work.
 	editor.sendTerminalInput(
 		shell.terminalId,
-		`fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)} >/dev/null 2>&1 &\n`,
+		`fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}\n`,
 	);
 	let seen = 0;
 	let lastOpened = "";

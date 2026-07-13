@@ -8,6 +8,8 @@ set -euo pipefail
 root="${1:?usage: fresh-watch-open <root> <queue-file>}"
 queue="${2:?usage: fresh-watch-open <root> <queue-file>}"
 
+echo "fresh-watch-open: watching $root"
+
 # -E: extended regex — without it the (a|b) alternations silently match nothing.
 exec fswatch -r -E --event Created --event Updated \
 	--exclude '/\.git(/|$)' \
@@ -19,4 +21,5 @@ exec fswatch -r -E --event Created --event Updated \
 	"$root" | while read -r f; do
 	[[ -f "$f" ]] || continue
 	echo "$f" >> "$queue"
+	echo "→ $f"
 done
