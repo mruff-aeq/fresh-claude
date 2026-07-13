@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Watch a workspace tree; append every created/modified file path to a queue
+# file. fresh's init.ts watches the queue and opens each entry as a tab in
+# the top editor split. Started automatically by init.ts in the bottom shell.
+#
+# Usage: fresh-watch-open <root> <queue-file>
+root="${1:?usage: fresh-watch-open <root> <queue-file>}"
+queue="${2:?usage: fresh-watch-open <root> <queue-file>}"
+
+# -E: extended regex — without it the (a|b) alternations silently match nothing.
+exec fswatch -r -E --event Created --event Updated \
+	--exclude '/\.git(/|$)' \
+	--exclude '/node_modules(/|$)' \
+	--exclude '/(\.venv|venv)(/|$)' \
+	--exclude '/(dist|build|coverage|__pycache__|\.pytest_cache|\.nuxt|\.output|\.fresh)(/|$)' \
+	--exclude '(package-lock\.json|pnpm-lock\.yaml|poetry\.lock)$' \
+	--exclude '\.(log|tmp)$' \
+	"$root" | while read -r f; do
+	[[ -f "$f" ]] || continue
+	echo "$f" >> "$queue"
+done

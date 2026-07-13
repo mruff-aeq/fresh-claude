@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Launch the fresh editor with the "claude" profile:
+#   file explorer | editor + shell below | Claude Code pane on the right.
+#
+# Usage: fresh-claude [workspace-dir]
+# Workspace resolution: argument > ~/.config/fresh-claude/workspace > $PWD.
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/fresh-claude/workspace"
+dir="${1:-}"
+if [[ -z "$dir" && -f "$config_file" ]]; then
+	dir="$(<"$config_file")"
+fi
+dir="${dir:-$PWD}"
+cd "$dir"
+
+# Explorer width must come from fresh's project config layer:
+# editor.setSetting("file_explorer.width", ...) updates the value but the
+# explorer never re-layouts from it (fresh 0.4.x).
+if [[ ! -f .fresh/config.json ]]; then
+	mkdir -p .fresh
+	printf '{\n  "file_explorer": { "width": "28" }\n}\n' > .fresh/config.json
+fi
+
+# init.ts spawns Claude Code directly as the PTY child (no login shell), so
+# hand it a full path — the PTY won't have your shell profile's PATH.
+FRESH_CLAUDE_BIN="$(command -v claude || true)"
+export FRESH_CLAUDE_BIN
+export FRESH_PROFILE=claude
+
+# --no-restore: fresh otherwise restores the last session's workspace
+# (splits, explorer state), overriding the layout init.ts builds.
+exec fresh --no-restore
