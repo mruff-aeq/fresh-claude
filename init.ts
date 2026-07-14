@@ -143,6 +143,34 @@
 			.catch((e) => editor.debug(`init.ts: diff highlight failed: ${e}`));
 	}
 
+	// closeBuffer refuses buffers with unsaved changes — and fresh (sometimes,
+	// timing-dependent) marks a buffer modified when its file is deleted out
+	// from under it, so the deleted-file tab can be exactly the case
+	// closeBuffer rejects. Launder it: save the buffer back to disk (clears
+	// the modified flag), close, then rm the recreated file. Plain rm beats
+	// fswatch's ~1s latency, so the file is gone again before its Created
+	// event drains from the queue and the tab can't reopen. (removePath only
+	// accepts temp/config paths and renamePath into the temp dir fails
+	// silently, so neither works here.)
+	function discardGoneBuffer(bufId: number, path: string) {
+		if (editor.isBufferModified(bufId)) {
+			if (!editor.saveBufferToPath(bufId, path)) {
+				editor.debug(`init.ts: could not launder deleted-file buffer for ${path}`);
+				return;
+			}
+			editor.closeBuffer(bufId);
+			editor
+				.spawnProcess("rm", ["-f", "--", path], editor.getCwd())
+				.then((r) => {
+					if (r.exit_code !== 0)
+						editor.debug(`init.ts: rm of laundered ${path} failed: ${r.stderr}`);
+				})
+				.catch((e) => editor.debug(`init.ts: rm of laundered ${path} failed: ${e}`));
+		} else {
+			editor.closeBuffer(bufId);
+		}
+	}
+
 	// Close the tab of a file that no longer exists on disk. If the editor
 	// split is currently SHOWING the doomed buffer, switch it to another file
 	// tab first — fresh otherwise promotes a terminal buffer into the pane.
@@ -169,7 +197,7 @@
 				}
 			}
 		}
-		editor.closeBuffer(gone);
+		discardGoneBuffer(gone, path);
 	}
 
 	// Manually opened files get highlights too, and revisiting a tab after a
