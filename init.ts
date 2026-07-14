@@ -45,6 +45,108 @@
 	});
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
+	// ── Diff highlights ──────────────────────────────────────────────────
+	// Paint a background on every line that differs from git HEAD, so a tab
+	// that pops open makes it obvious WHAT changed, not just that it did.
+	// Untracked files are all-new → whole file painted. Non-git workspaces
+	// get no highlights (there is no baseline to diff against).
+	const DIFF_NS = "fresh-claude-diff";
+	const DIFF_BG: [number, number, number] = [22, 68, 38];
+
+	const dirOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
+	// "./name" pathspec keeps git happy with cwd-relative paths from any
+	// subdirectory, and handles nested repos via cwd resolution.
+	const specOf = (p: string) => "./" + p.slice(p.lastIndexOf("/") + 1);
+
+	// [startLine, endLine] pairs (1-indexed, inclusive) of added/modified
+	// lines; "all" for untracked files; null when not in a git repo.
+	async function changedLineRanges(
+		path: string,
+	): Promise<Array<[number, number]> | "all" | null> {
+		const dir = dirOf(path);
+		const spec = specOf(path);
+		let res = await editor.spawnProcess(
+			"git",
+			["diff", "-U0", "--no-color", "HEAD", "--", spec],
+			dir,
+		);
+		if (res.exit_code !== 0) {
+			// Unborn HEAD (repo with no commits) — diff against the index.
+			res = await editor.spawnProcess(
+				"git",
+				["diff", "-U0", "--no-color", "--", spec],
+				dir,
+			);
+			if (res.exit_code !== 0) return null;
+		}
+		const ranges: Array<[number, number]> = [];
+		const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
+		let m: RegExpExecArray | null;
+		while ((m = hunk.exec(res.stdout)) !== null) {
+			const start = parseInt(m[1], 10);
+			const count = m[2] === undefined ? 1 : parseInt(m[2], 10);
+			if (count > 0) ranges.push([start, start + count - 1]);
+		}
+		if (ranges.length === 0 && res.stdout === "") {
+			const tracked = await editor.spawnProcess(
+				"git",
+				["ls-files", "--error-unmatch", spec],
+				dir,
+			);
+			if (tracked.exit_code !== 0) return "all";
+		}
+		return ranges;
+	}
+
+	async function highlightDiff(path: string, bufferId: number) {
+		const ranges = await changedLineRanges(path);
+		if (ranges === null) return;
+		editor.clearNamespace(bufferId, DIFF_NS);
+		const content = editor.readFile(path);
+		if (content === null) return;
+		// Both key spellings — the API docs and OverlayOptions disagree.
+		const style = { bg: DIFF_BG, extendToLineEnd: true, extend_to_line_end: true };
+		const total = editor.utf8ByteLength(content);
+		if (ranges === "all") {
+			if (total > 0) editor.addOverlay(bufferId, DIFF_NS, 0, total, style);
+			return;
+		}
+		if (ranges.length === 0) return;
+		const lines = content.split("\n");
+		// starts[i] = byte offset of line i (0-indexed); overlays take bytes.
+		const starts: number[] = [0];
+		for (const line of lines)
+			starts.push(starts[starts.length - 1] + editor.utf8ByteLength(line) + 1);
+		for (const [a, b] of ranges) {
+			const s = starts[Math.min(a - 1, lines.length - 1)];
+			// End of line b: start of line b+1 minus its "\n" (clamped for a
+			// missing trailing newline on the last line).
+			const e = Math.min(starts[Math.min(b, lines.length)] - 1, total);
+			if (e > s) editor.addOverlay(bufferId, DIFF_NS, s, e, style);
+		}
+	}
+
+	// Serialize refreshes so two rapid events for one file can't interleave
+	// their clear/add passes.
+	let diffChain: Promise<void> = Promise.resolve();
+	function scheduleHighlight(path: string) {
+		diffChain = diffChain
+			.then(async () => {
+				if (!editor.fileExists(path)) return;
+				const bufId = editor.findBufferByPath(path);
+				if (bufId) await highlightDiff(path, bufId);
+			})
+			.catch((e) => editor.debug(`init.ts: diff highlight failed: ${e}`));
+	}
+
+	// Manually opened files get highlights too, and revisiting a tab after a
+	// commit re-diffs it so stale highlights clear.
+	editor.on("after_file_open", (args) => scheduleHighlight(args.path));
+	editor.on("buffer_activated", (args) => {
+		const p = editor.getBufferPath(args.buffer_id);
+		if (p) scheduleHighlight(p);
+	});
+
 	// Auto-open edited files as tabs in the TOP editor split.
 	// fswatch (in the bottom shell — fresh's own recursive watchPath dies
 	// with EMFILE on big trees) appends changed paths to a queue file;
@@ -69,11 +171,13 @@
 			if (text === null) return;
 			const lines = text.split("\n").filter(Boolean);
 			for (const p of lines.slice(seen)) {
-				if (p === lastOpened) continue; // don't re-yank the active tab
-				lastOpened = p;
-				if (editorSplitId !== undefined && editor.fileExists(p)) {
+				if (!editor.fileExists(p)) continue;
+				// Don't re-yank the active tab, but still refresh its highlights.
+				if (editorSplitId !== undefined && p !== lastOpened) {
+					lastOpened = p;
 					editor.openFileInSplit(editorSplitId, p, 0, 0);
 				}
+				scheduleHighlight(p);
 			}
 			seen = lines.length;
 		});
