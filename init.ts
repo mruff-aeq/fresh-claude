@@ -139,6 +139,35 @@
 			.catch((e) => editor.debug(`init.ts: diff highlight failed: ${e}`));
 	}
 
+	// Close the tab of a file that no longer exists on disk. If the editor
+	// split is currently SHOWING the doomed buffer, switch it to another file
+	// tab first — fresh otherwise promotes a terminal buffer into the pane.
+	function closeGoneBuffer(path: string) {
+		const gone = editor.findBufferByPath(path);
+		if (!gone) return;
+		if (editorSplitId !== undefined) {
+			const split = editor.listSplits().find((s) => s.splitId === editorSplitId);
+			if (split && split.bufferId === gone) {
+				const other = editor
+					.listBuffers()
+					.filter((b) => b.id !== gone && !b.is_virtual && b.path && editor.fileExists(b.path))
+					.pop();
+				if (other) {
+					editor.setSplitBuffer(editorSplitId, other.id);
+				} else {
+					// No file tab left to show: put an empty buffer in the
+					// editor split ("new" acts on the focused split, so hop
+					// focus there and back).
+					const prevSplit = editor.getActiveSplitId();
+					editor.focusSplit(editorSplitId);
+					editor.executeAction("new");
+					editor.focusSplit(prevSplit);
+				}
+			}
+		}
+		editor.closeBuffer(gone);
+	}
+
 	// Manually opened files get highlights too, and revisiting a tab after a
 	// commit re-diffs it so stale highlights clear.
 	editor.on("after_file_open", (args) => scheduleHighlight(args.path));
@@ -171,7 +200,13 @@
 			if (text === null) return;
 			const lines = text.split("\n").filter(Boolean);
 			for (const p of lines.slice(seen)) {
-				if (!editor.fileExists(p)) continue;
+				if (!editor.fileExists(p)) {
+					// Deleted or renamed away — close the stale tab so temp
+					// files don't linger after Claude cleans them up.
+					closeGoneBuffer(p);
+					if (p === lastOpened) lastOpened = "";
+					continue;
+				}
 				// Don't re-yank the active tab, but still refresh its highlights.
 				if (editorSplitId !== undefined && p !== lastOpened) {
 					lastOpened = p;

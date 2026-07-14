@@ -11,7 +11,10 @@ queue="${2:?usage: fresh-watch-open <root> <queue-file>}"
 echo "fresh-watch-open: watching $root"
 
 # -E: extended regex — without it the (a|b) alternations silently match nothing.
+# Removed/Renamed/Moved* let init.ts close tabs for deleted files (FSEvents
+# reports renames as Renamed on both paths; inotify uses MovedFrom/MovedTo).
 exec fswatch -r -E --event Created --event Updated \
+	--event Removed --event Renamed --event MovedFrom --event MovedTo \
 	--exclude '/\.git(/|$)' \
 	--exclude '/node_modules(/|$)' \
 	--exclude '/(\.venv|venv)(/|$)' \
@@ -19,7 +22,13 @@ exec fswatch -r -E --event Created --event Updated \
 	--exclude '(package-lock\.json|pnpm-lock\.yaml|poetry\.lock)$' \
 	--exclude '\.(log|tmp)$' \
 	"$root" | while read -r f; do
-	[[ -f "$f" ]] || continue
-	echo "$f" >> "$queue"
-	echo "→ $f"
+	if [[ -f "$f" ]]; then
+		echo "$f" >> "$queue"
+		echo "→ $f"
+	elif [[ ! -e "$f" ]]; then
+		# Gone (deleted or renamed away) — forward so init.ts can close
+		# the stale tab. Directories ([[ -e ]] but not [[ -f ]]) are skipped.
+		echo "$f" >> "$queue"
+		echo "✕ $f"
+	fi
 done

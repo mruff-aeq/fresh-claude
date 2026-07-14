@@ -18,6 +18,8 @@ anything else — automatically opens as a tab in the editor pane, so you can
 watch what Claude is doing while it works. Lines that differ from git HEAD
 get a green background, so it's obvious *what* changed in each file, not
 just that it did — untracked files are painted whole (everything is new).
+When a file is deleted (say, a temp script Claude cleaned up), its tab
+closes automatically instead of lingering.
 
 ## Requirements
 
@@ -70,7 +72,10 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
 - **`bin/fresh-watch-open`** — fswatch on the workspace appends changed paths
   to a per-launch queue file in `/tmp`; init.ts watches that single file.
   (fresh's own recursive `watchPath` runs out of file descriptors on big
-  trees; fswatch uses FSEvents/inotify and doesn't.)
+  trees; fswatch uses FSEvents/inotify and doesn't.) Deleted and renamed-away
+  paths are forwarded too; init.ts closes their tabs, first switching the
+  editor split to another file tab (or an empty buffer) if the doomed one is
+  showing — otherwise fresh promotes a terminal buffer into the pane.
 
 ## Tuning
 
