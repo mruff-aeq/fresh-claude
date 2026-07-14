@@ -98,8 +98,12 @@
 		return ranges;
 	}
 
-	async function highlightDiff(path: string, bufferId: number) {
-		const ranges = await changedLineRanges(path);
+	async function highlightDiff(
+		path: string,
+		bufferId: number,
+		ranges?: Array<[number, number]> | "all" | null,
+	) {
+		if (ranges === undefined) ranges = await changedLineRanges(path);
 		if (ranges === null) return;
 		editor.clearNamespace(bufferId, DIFF_NS);
 		const content = editor.readFile(path);
@@ -192,6 +196,25 @@
 	);
 	let seen = 0;
 	let lastOpened = "";
+	// Open only when the file actually differs from HEAD — git churn
+	// (checkout/merge rewriting files back to committed content) produces
+	// watcher events with an empty diff, and opening those is pure clutter.
+	// "all" (untracked) and null (no git baseline) both still open.
+	function scheduleOpenAndHighlight(path: string) {
+		diffChain = diffChain
+			.then(async () => {
+				if (!editor.fileExists(path)) return;
+				const ranges = await changedLineRanges(path);
+				const changed = ranges === null || ranges === "all" || ranges.length > 0;
+				if (changed && editorSplitId !== undefined && path !== lastOpened) {
+					lastOpened = path;
+					editor.openFileInSplit(editorSplitId, path, 0, 0);
+				}
+				const bufId = editor.findBufferByPath(path);
+				if (bufId) await highlightDiff(path, bufId, ranges);
+			})
+			.catch((e) => editor.debug(`init.ts: open+highlight failed: ${e}`));
+	}
 	try {
 		const queueHandle = await editor.watchPath(queue, false);
 		editor.on("path_changed", (args) => {
@@ -207,12 +230,7 @@
 					if (p === lastOpened) lastOpened = "";
 					continue;
 				}
-				// Don't re-yank the active tab, but still refresh its highlights.
-				if (editorSplitId !== undefined && p !== lastOpened) {
-					lastOpened = p;
-					editor.openFileInSplit(editorSplitId, p, 0, 0);
-				}
-				scheduleHighlight(p);
+				scheduleOpenAndHighlight(p);
 			}
 			seen = lines.length;
 		});

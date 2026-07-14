@@ -15,7 +15,9 @@ One command opens:
 
 Any file created or modified in the workspace — by Claude Code, git, or
 anything else — automatically opens as a tab in the editor pane, so you can
-watch what Claude is doing while it works. Lines that differ from git HEAD
+watch what Claude is doing while it works. Files whose content ends up
+identical to git HEAD (e.g. rewritten by `git checkout` or a merge) are
+skipped — no diff, no tab. Lines that differ from git HEAD
 get a green background, so it's obvious *what* changed in each file, not
 just that it did — untracked files are painted whole (everything is new).
 When a file is deleted (say, a temp script Claude cleaned up), its tab
@@ -63,8 +65,9 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
   workspace, and runs `fresh --no-restore`.
 - **`init.ts`** — fresh auto-runs this at startup. When the profile is active
   it opens the explorer, spawns Claude Code in a right-hand vertical split and
-  a shell below the editor, then starts the watcher and opens every queued
-  file in the top editor split via `openFileInSplit`. For each opened or
+  a shell below the editor, then starts the watcher and opens each queued
+  file that differs from git HEAD in the top editor split via
+  `openFileInSplit`. For each opened or
   changed file it runs `git diff -U0 HEAD -- <file>` and paints the
   added/modified lines with a buffer overlay (namespace `fresh-claude-diff`);
   highlights refresh on every watcher event, file open, and tab switch, so
@@ -97,8 +100,10 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
   the one init.ts builds — the wrapper always passes it.
 - Hot-exit buffers (unsaved files) survive `--no-restore` by design; close
   stray tabs once and they stay gone.
-- Bulk file churn in a non-ignored path (e.g. `git checkout` across many
-  files) opens one tab per file.
+- Bulk file churn in a non-ignored path opens one tab per file — but only
+  for files that actually differ from HEAD afterwards, so `git checkout` /
+  merge rewrites no longer open anything. In a non-git workspace there is
+  no baseline and every changed file still opens.
 - Changed-line highlights need a git repo — the baseline is `HEAD` (or the
   index before the first commit). Non-git workspaces get tabs but no
   highlights. Staged-but-uncommitted files in a repo with no commits yet
