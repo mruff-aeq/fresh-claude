@@ -18,6 +18,7 @@ need() {
 }
 need fresh "install from https://getfresh.dev (brew install sinelaw/fresh/fresh)"
 need fswatch "brew install fswatch / apt install fswatch"
+need python3 "install Python 3 (macOS: xcode-select --install / apt install python3)"
 need claude "install Claude Code: https://claude.com/claude-code"
 if [[ "$missing" -eq 1 ]]; then
 	echo "Install the missing dependencies and re-run." >&2

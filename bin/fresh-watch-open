@@ -1,34 +1,222 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# Watch a workspace tree; append every created/modified file path to a queue
-# file. fresh's init.ts watches the queue and opens each entry as a tab in
-# the top editor split. Started automatically by init.ts in the bottom shell.
-#
-# Usage: fresh-watch-open <root> <queue-file>
-root="${1:?usage: fresh-watch-open <root> <queue-file>}"
-queue="${2:?usage: fresh-watch-open <root> <queue-file>}"
+#!/usr/bin/env python3
+"""Watch a workspace tree and queue changed files for fresh to auto-open —
+but suppress the churn a test run spits out.
 
-echo "fresh-watch-open: watching $root"
+fswatch answers *what* changed, never *who* changed it, so a naive watcher
+opens a tab for every temp file pytest/jest/etc. drop mid-run, cluttering the
+editor. There is no unprivileged way to attribute a write to a PID (that needs
+eslogger/fs_usage/DTrace on macOS or fanotify/auditd on Linux — all root), so
+instead we correlate: while a test runner is alive in *this editor's* process
+subtree, files appearing in the tree are treated as test output and skipped.
 
-# -E: extended regex — without it the (a|b) alternations silently match nothing.
-# Removed/Renamed/Moved* let init.ts close tabs for deleted files (FSEvents
-# reports renames as Renamed on both paths; inotify uses MovedFrom/MovedTo).
-exec fswatch -r -E --event Created --event Updated \
-	--event Removed --event Renamed --event MovedFrom --event MovedTo \
-	--exclude '/\.git(/|$)' \
-	--exclude '/node_modules(/|$)' \
-	--exclude '/(\.venv|venv)(/|$)' \
-	--exclude '/(dist|build|coverage|__pycache__|\.pytest_cache|\.nuxt|\.output|\.fresh)(/|$)' \
-	--exclude '(package-lock\.json|pnpm-lock\.yaml|poetry\.lock)$' \
-	--exclude '\.(log|tmp)$' \
-	"$root" | while read -r f; do
-	if [[ -f "$f" ]]; then
-		echo "$f" >> "$queue"
-		echo "→ $f"
-	elif [[ ! -e "$f" ]]; then
-		# Gone (deleted or renamed away) — forward so init.ts can close
-		# the stale tab. Directories ([[ -e ]] but not [[ -f ]]) are skipped.
-		echo "$f" >> "$queue"
-		echo "✕ $f"
-	fi
-done
+Scoping needs no PID handoff. This watcher runs in fresh's bottom shell, so it
+is a descendant of the `fresh` editor process — and so are the agent's PTY
+child and any tests that agent spawns. We walk our own parent chain up to
+FRESH_PID, then ask "is a test runner among its descendants right now?" That is
+vendor-neutral: it never has to know the agent is claude vs opencode vs aider.
+
+A short per-path debounce is the key to correctness: opening is allowed to lag,
+so we let each burst settle (and let the sampler observe the runner that is
+mid-write) before deciding — the ~1s fswatch latency no longer races the
+process check.
+
+Usage: fresh-watch-open <root> <queue-file>
+init.ts watches <queue-file> and opens/closes tabs for each appended path.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+# ── knobs (env-overridable, no edit needed to tune) ──────────────────────────
+DEBOUNCE = float(os.environ.get("FRESH_WATCH_DEBOUNCE", "1.5"))  # quiet secs/path
+GRACE = float(os.environ.get("FRESH_WATCH_GRACE", "3.0"))        # runner-active window
+SAMPLE = float(os.environ.get("FRESH_WATCH_SAMPLE", "0.25"))     # process-poll period
+
+# Full-command patterns of test runners. Matched against `ps ... command=`, so
+# multi-word invocations (`go test`, `python -m pytest`) work, not just comm.
+TEST_RE = re.compile(
+    r"\b(pytest|py\.test|jest|vitest|mocha|ava|jasmine|karma|phpunit|rspec|"
+    r"minitest|nose2?|tox|nyc|c8|playwright|cypress|nextest)\b"
+    r"|\b(go|cargo)\s+test\b"
+    r"|\bpython[0-9.]*\b.*\s-m\s+(pytest|unittest)\b"
+    r"|\bnode\b.*\s--test\b"
+    r"|\b(npm|yarn|pnpm|bun)\b.*\btest\b",
+    re.IGNORECASE,
+)
+
+
+def ps_snapshot():
+    """Return {pid: (ppid, command)} for every process. Empty on failure."""
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=4,
+        ).stdout
+    except Exception:
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, parts[2] if len(parts) > 2 else "")
+    return procs
+
+
+def find_fresh_pid():
+    """Walk our parent chain up to the `fresh` editor process; None if absent."""
+    procs = ps_snapshot()
+    cur = os.getppid()
+    seen = set()
+    while cur > 1 and cur in procs and cur not in seen:
+        seen.add(cur)
+        ppid, cmd = procs[cur]
+        first = cmd.split(None, 1)[0] if cmd else ""
+        if os.path.basename(first) == "fresh":
+            return cur
+        cur = ppid
+    return None
+
+
+def test_runner_alive(root_pid, procs):
+    """True if any descendant of root_pid looks like a test runner."""
+    children = {}
+    for pid, (ppid, _cmd) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+    stack = list(children.get(root_pid, []))
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        cmd = procs.get(pid, (0, ""))[1]
+        if cmd and TEST_RE.search(cmd):
+            return True
+        stack.extend(children.get(pid, []))
+    return False
+
+
+# ── shared state ─────────────────────────────────────────────────────────────
+_lock = threading.Lock()
+_last_test_seen = None          # monotonic time a runner was last observed
+_pending = {}                   # path -> [first_seen, last_seen]
+_fresh_pid = None
+
+
+def sampler():
+    """Poll the process subtree; stamp _last_test_seen while a runner is up."""
+    global _last_test_seen
+    while True:
+        procs = ps_snapshot()
+        if _fresh_pid is not None and test_runner_alive(_fresh_pid, procs):
+            with _lock:
+                _last_test_seen = time.monotonic()
+        time.sleep(SAMPLE)
+
+
+def flusher(qf):
+    """Emit each path once it has been quiet for DEBOUNCE seconds."""
+    while True:
+        now = time.monotonic()
+        ready = []
+        with _lock:
+            for path, (first, last) in list(_pending.items()):
+                if now - last >= DEBOUNCE:
+                    ready.append((path, first))
+                    del _pending[path]
+            last_test = _last_test_seen
+        for path, first in ready:
+            decide(path, first, last_test, qf)
+        time.sleep(0.1)
+
+
+def decide(path, first_seen, last_test, qf):
+    if os.path.isfile(path):
+        # Suppress if a test runner was alive anywhere from ~write-time onward.
+        if last_test is not None and last_test >= first_seen - GRACE:
+            print(f"✕ (test churn) {path}", flush=True)
+            return
+        emit(path, qf)
+        print(f"→ {path}", flush=True)
+    elif not os.path.exists(path):
+        # Gone (deleted or renamed away): forward so init.ts closes the stale
+        # tab. Never clutter, so never suppressed. Directories are skipped.
+        emit(path, qf)
+        print(f"✕ {path}", flush=True)
+    # exists-but-not-a-file → a directory event; ignore.
+
+
+def emit(path, qf):
+    qf.write(path + "\n")
+    qf.flush()
+
+
+def main():
+    global _fresh_pid
+    if len(sys.argv) != 3:
+        sys.exit("usage: fresh-watch-open <root> <queue-file>")
+    root, queue = sys.argv[1], sys.argv[2]
+
+    _fresh_pid = find_fresh_pid()
+    if _fresh_pid is None:
+        print(
+            "fresh-watch-open: no `fresh` ancestor found — test-churn "
+            "suppression disabled (opening all changed files)",
+            flush=True,
+        )
+    print(f"fresh-watch-open: watching {root}", flush=True)
+
+    qf = open(queue, "a", buffering=1)
+
+    threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=flusher, args=(qf,), daemon=True).start()
+
+    # -E: extended regex so the (a|b) alternations actually match.
+    # Created/Updated feed opens; Removed/Renamed/Moved* let init.ts close tabs
+    # (FSEvents reports renames as Renamed on both paths; inotify splits them
+    # into MovedFrom/MovedTo). Classification is by stat() at flush time, not by
+    # the event flag, so no -x needed.
+    proc = subprocess.Popen(
+        [
+            "fswatch", "-r", "-E",
+            "--event", "Created", "--event", "Updated",
+            "--event", "Removed", "--event", "Renamed",
+            "--event", "MovedFrom", "--event", "MovedTo",
+            "--exclude", r"/\.git(/|$)",
+            "--exclude", r"/node_modules(/|$)",
+            "--exclude", r"/(\.venv|venv)(/|$)",
+            "--exclude",
+            r"/(dist|build|coverage|__pycache__|\.pytest_cache|\.nuxt|\.output|\.fresh)(/|$)",
+            "--exclude", r"(package-lock\.json|pnpm-lock\.yaml|poetry\.lock)$",
+            "--exclude", r"\.(log|tmp)$",
+            root,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for line in proc.stdout:
+            path = line.rstrip("\n")
+            if not path:
+                continue
+            now = time.monotonic()
+            with _lock:
+                if path in _pending:
+                    _pending[path][1] = now
+                else:
+                    _pending[path] = [now, now]
+    finally:
+        proc.terminate()
+
+
+if __name__ == "__main__":
+    main()
