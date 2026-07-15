@@ -19,10 +19,12 @@ watch what Claude is doing while it works. The dozens of temp files a test
 run drops mid-execution are filtered out: while a test runner is alive in the
 editor's process subtree, files appearing in the tree are treated as churn
 and skipped, so the tab bar stays about the code, not the test output. Files
-whose content ends up identical to git HEAD (e.g. rewritten by `git checkout`
-or a merge) are skipped too — no diff, no tab. Lines that differ from git HEAD
-get a green background, so it's obvious *what* changed in each file, not
-just that it did — untracked files are painted whole (everything is new).
+whose content ends up identical to how it was at launch (e.g. rewritten back
+by a revert or a checkout) are skipped too — no diff, no tab. Lines that
+differ from launch get a green background, so it's obvious *what* changed in
+each file, not just that it did — files created since launch are painted
+whole (everything is new). The baseline is a snapshot of the workspace taken
+when fresh-claude starts, so this works in any directory, git or not.
 When a file is deleted (say, a temp script Claude cleaned up), its tab
 closes automatically instead of lingering.
 
@@ -31,6 +33,9 @@ closes automatically instead of lingering.
 - [fresh](https://getfresh.dev) 0.4.x (`brew install sinelaw/fresh/fresh`)
 - [fswatch](https://github.com/emcrisostomo/fswatch) (`brew install fswatch` / `apt install fswatch`)
 - Python 3 (ships with macOS Command Line Tools; `apt install python3` on Linux)
+- `git` (used for `diff --no-index` to compute changed lines — no repo needed;
+  without it, tabs still open but get no highlights). `rsync` is used for the
+  launch snapshot when present, falling back to `tar`.
 - [Claude Code](https://claude.com/claude-code)
 - macOS or Linux
 
@@ -68,14 +73,16 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
   binary for the PTY, seeds `.fresh/config.json` (explorer width) in the
   workspace, and runs `fresh --no-restore`.
 - **`init.ts`** — fresh auto-runs this at startup. When the profile is active
-  it opens the explorer, spawns Claude Code in a right-hand vertical split and
-  a shell below the editor, then starts the watcher and opens each queued
-  file that differs from git HEAD in the top editor split via
-  `openFileInSplit`. For each opened or
-  changed file it runs `git diff -U0 HEAD -- <file>` and paints the
+  it first mirrors the workspace into a per-launch `/tmp` snapshot (the
+  highlight baseline, captured before Claude can edit anything; heavy dirs and
+  files over 1 MB are skipped). Then it opens the explorer, spawns Claude Code
+  in a right-hand vertical split and a shell below the editor, and starts the
+  watcher, opening each queued file that differs from the snapshot in the top
+  editor split via `openFileInSplit`. For each opened or changed file it runs
+  `git diff --no-index -U0 <snapshot> <file>` (no repo required) and paints the
   added/modified lines with a buffer overlay (namespace `fresh-claude-diff`);
   highlights refresh on every watcher event, file open, and tab switch, so
-  they clear the next time you look at a file after committing.
+  they clear once a file is reverted to its launch state.
 - **`bin/fresh-watch-open`** (Python 3) — fswatch on the workspace feeds changed
   paths, which the watcher appends to a per-launch queue file in `/tmp`; init.ts
   watches that single file. (fresh's own recursive `watchPath` runs out of file
@@ -131,15 +138,15 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
 - Hot-exit buffers (unsaved files) survive `--no-restore` by design; close
   stray tabs once and they stay gone.
 - Bulk file churn in a non-ignored path opens one tab per file — but only
-  for files that actually differ from HEAD afterwards, so `git checkout` /
-  merge rewrites no longer open anything, and files written while a test
-  runner is alive are suppressed. In a non-git workspace there is no baseline,
-  so HEAD-identical files still open (test-churn suppression is independent of
-  git and works either way).
-- Changed-line highlights need a git repo — the baseline is `HEAD` (or the
-  index before the first commit). Non-git workspaces get tabs but no
-  highlights. Staged-but-uncommitted files in a repo with no commits yet
-  show none either.
+  for files that actually differ from the launch snapshot afterwards, so a
+  revert/checkout that rewrites a file back to its baseline opens nothing, and
+  files written while a test runner is alive are suppressed.
+- Changed-line highlights are relative to the **launch snapshot**, not git —
+  they show what changed since fresh-claude started, in any directory. A file
+  edited, then reverted to its launch content, loses its highlights. Files
+  over 1 MB and the excluded heavy dirs are not snapshotted, so they get tabs
+  but no highlights. The snapshot is per-launch, so restarting fresh-claude
+  re-baselines everything to the current on-disk state.
 
 ## Uninstall
 

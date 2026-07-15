@@ -8,6 +8,46 @@
 (async () => {
 	if (editor.getEnv("FRESH_PROFILE") !== "claude") return;
 
+	// ── Session snapshot (highlight baseline) ────────────────────────────
+	// Green highlights diff each file against a launch-time MIRROR of the
+	// workspace, not git HEAD — so highlighting works in any directory, git or
+	// not, and shows exactly what changed since fresh-claude started. Captured
+	// HERE, before Claude spawns, so the baseline is pristine (the watcher only
+	// learns of a write after the fact, so there is no other way to know a
+	// file's pre-edit content). The mirror lives in /tmp — fast enough for
+	// source text, and a ramdisk buys nothing for KB-sized files. Files >1 MB
+	// and the usual heavy dirs are skipped; those simply get no highlights.
+	const CWD = editor.getCwd();
+	const SNAP_DIR = `/tmp/fresh-snap-${Date.now()}`;
+	const MAX_BYTES = 1024 * 1024;
+	// rsync (with --max-size) when present, else a tar pipe (cap enforced at
+	// diff time instead). $ex is deliberately unquoted for word-splitting into
+	// separate --exclude args. Paths arrive as $1/$2, so no shell injection.
+	const SNAP_SCRIPT = `
+set -e
+src=$1; snap=$2
+mkdir -p "$snap"
+ex="--exclude=.git --exclude=node_modules --exclude=.venv --exclude=venv --exclude=dist --exclude=build --exclude=coverage --exclude=__pycache__ --exclude=.pytest_cache --exclude=.nuxt --exclude=.output --exclude=.fresh"
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --max-size=1048576 $ex "$src"/ "$snap"/
+else
+  tar -cf - -C "$src" $ex . | tar -xf - -C "$snap"
+fi
+`;
+	try {
+		const snap = await editor.spawnProcess(
+			"sh",
+			["-c", SNAP_SCRIPT, "_", CWD, SNAP_DIR],
+			CWD,
+		);
+		if (snap.exit_code !== 0)
+			editor.debug(
+				`init.ts: workspace snapshot failed (highlights degrade to all-new): ${snap.stderr}`,
+			);
+	} catch (e) {
+		editor.debug(`init.ts: workspace snapshot error: ${e}`);
+	}
+
 	// Show the file explorer sidebar (hidden by default on a fresh workspace).
 	// Width comes from .fresh/config.json in the project dir — setSetting
 	// updates the value but the explorer never re-layouts from it.
@@ -46,39 +86,46 @@
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
 	// ── Diff highlights ──────────────────────────────────────────────────
-	// Paint a background on every line that differs from git HEAD, so a tab
-	// that pops open makes it obvious WHAT changed, not just that it did.
-	// Untracked files are all-new → whole file painted. Non-git workspaces
-	// get no highlights (there is no baseline to diff against).
+	// Paint a background on every line that differs from the launch snapshot,
+	// so a tab that pops open makes it obvious WHAT changed, not just that it
+	// did. Files new since launch are painted whole. Baseline is the snapshot
+	// mirror captured above — no git required, works in any directory.
 	const DIFF_NS = "fresh-claude-diff";
 	const DIFF_BG: [number, number, number] = [22, 68, 38];
 
-	const dirOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
-	// "./name" pathspec keeps git happy with cwd-relative paths from any
-	// subdirectory, and handles nested repos via cwd resolution.
-	const specOf = (p: string) => "./" + p.slice(p.lastIndexOf("/") + 1);
+	// Path to a file's baseline copy inside the launch snapshot mirror. null
+	// when the path is outside the workspace — watcher paths never are, but the
+	// manual-open / tab-switch handlers can fire for anything.
+	function snapPathOf(path: string): string | null {
+		if (path.startsWith(CWD + "/")) return SNAP_DIR + "/" + path.slice(CWD.length + 1);
+		return null;
+	}
 
-	// [startLine, endLine] pairs (1-indexed, inclusive) of added/modified
-	// lines; "all" for untracked files; null when not in a git repo.
+	// [startLine, endLine] pairs (1-indexed, inclusive) of lines that differ
+	// from the launch snapshot; "all" for files new since launch (no snapshot
+	// entry — everything is new); null when outside the workspace, unreadable,
+	// or over the 1 MB cap (no highlight either way).
 	async function changedLineRanges(
 		path: string,
 	): Promise<Array<[number, number]> | "all" | null> {
-		const dir = dirOf(path);
-		const spec = specOf(path);
-		let res = await editor.spawnProcess(
+		const snap = snapPathOf(path);
+		if (snap === null) return null;
+		const content = editor.readFile(path);
+		if (content === null) return null;
+		// Size cap first, so a >1 MB file (absent from the mirror) is skipped
+		// rather than painted whole via the "all" branch below.
+		if (editor.utf8ByteLength(content) > MAX_BYTES) return null;
+		if (!editor.fileExists(snap)) return "all";
+		// git diff --no-index needs no repo. Exit 0 = identical, 1 = differs
+		// (parse hunks), >1 = error. Binary diffs print "Binary files … differ"
+		// with no @@ hunks, so they fall through to an empty range set.
+		const res = await editor.spawnProcess(
 			"git",
-			["diff", "-U0", "--no-color", "HEAD", "--", spec],
-			dir,
+			["diff", "--no-index", "-U0", "--no-color", "--", snap, path],
+			CWD,
 		);
-		if (res.exit_code !== 0) {
-			// Unborn HEAD (repo with no commits) — diff against the index.
-			res = await editor.spawnProcess(
-				"git",
-				["diff", "-U0", "--no-color", "--", spec],
-				dir,
-			);
-			if (res.exit_code !== 0) return null;
-		}
+		if (res.exit_code === 0) return [];
+		if (res.exit_code > 1 && res.stdout === "") return null;
 		const ranges: Array<[number, number]> = [];
 		const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
 		let m: RegExpExecArray | null;
@@ -86,14 +133,6 @@
 			const start = parseInt(m[1], 10);
 			const count = m[2] === undefined ? 1 : parseInt(m[2], 10);
 			if (count > 0) ranges.push([start, start + count - 1]);
-		}
-		if (ranges.length === 0 && res.stdout === "") {
-			const tracked = await editor.spawnProcess(
-				"git",
-				["ls-files", "--error-unmatch", spec],
-				dir,
-			);
-			if (tracked.exit_code !== 0) return "all";
 		}
 		return ranges;
 	}
@@ -200,8 +239,9 @@
 		discardGoneBuffer(gone, path);
 	}
 
-	// Manually opened files get highlights too, and revisiting a tab after a
-	// commit re-diffs it so stale highlights clear.
+	// Manually opened files get highlights too, and revisiting a tab re-diffs
+	// it against the snapshot so highlights clear once a file is reverted to
+	// its launch state.
 	editor.on("after_file_open", (args) => scheduleHighlight(args.path));
 	editor.on("buffer_activated", (args) => {
 		const p = editor.getBufferPath(args.buffer_id);
@@ -224,10 +264,10 @@
 	);
 	let seen = 0;
 	let lastOpened = "";
-	// Open only when the file actually differs from HEAD — git churn
-	// (checkout/merge rewriting files back to committed content) produces
-	// watcher events with an empty diff, and opening those is pure clutter.
-	// "all" (untracked) and null (no git baseline) both still open.
+	// Open only when the file actually differs from the launch snapshot — a
+	// file rewritten back to its baseline (checkout/merge/revert) produces a
+	// watcher event with an empty diff, and opening that is pure clutter.
+	// "all" (new since launch) and null (over cap / outside workspace) open.
 	function scheduleOpenAndHighlight(path: string) {
 		diffChain = diffChain
 			.then(async () => {
