@@ -16,10 +16,25 @@ cd "$dir"
 
 # Explorer width must come from fresh's project config layer:
 # editor.setSetting("file_explorer.width", ...) updates the value but the
-# explorer never re-layouts from it (fresh 0.4.x).
+# explorer never re-layouts from it (fresh 0.4.x). show_hidden makes the
+# explorer list dotfiles; a workspace that already sets show_hidden (either
+# value) is left alone.
 if [[ ! -f .fresh/config.json ]]; then
 	mkdir -p .fresh
-	printf '{\n  "file_explorer": { "width": "28" }\n}\n' > .fresh/config.json
+	printf '{\n  "file_explorer": { "width": "28", "show_hidden": true }\n}\n' > .fresh/config.json
+elif ! grep -q show_hidden .fresh/config.json && command -v python3 >/dev/null; then
+	python3 - <<'EOF'
+import json
+p = ".fresh/config.json"
+try:
+    cfg = json.load(open(p))
+except Exception:
+    raise SystemExit(0)
+cfg.setdefault("file_explorer", {}).setdefault("show_hidden", True)
+with open(p, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+EOF
 fi
 
 # init.ts spawns Claude Code directly as the PTY child (no login shell), so
