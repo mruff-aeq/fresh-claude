@@ -83,6 +83,48 @@ fi
 		ratio: 0.75,
 		focus: false,
 	});
+
+	// (The shell is hopped into tmux at the watcher-launch step below — one
+	// typed line does both, see the comment there.)
+
+	// Second terminal as a TAB next to Terminal 1: the watcher occupies
+	// Terminal 1's foreground, so this one is for actual shell work. There
+	// is no create-as-tab API — createTerminal always splits — so: create it
+	// in a throwaway split, DISPLAY its buffer in the shell split (which
+	// registers it as a tab there), flip the shell split back to Terminal 1,
+	// and only then close the throwaway split. Closing first loses the
+	// buffer (verified: the tab never appears) — a buffer only survives a
+	// split close while some split still owns it. Its own persistent tmux
+	// session (fresh-shell) — same leak-eating rationale as below, but a
+	// plain `exec` typed line suffices: nothing else types into this pane,
+	// so there is no stale-watcher or multi-line race to manage.
+	const workShell = await editor.createTerminal({
+		direction: "vertical",
+		ratio: 0.5,
+		focus: false,
+	});
+	{
+		const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
+		if (tmuxBin)
+			editor.sendTerminalInput(
+				workShell.terminalId,
+				`exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh-shell\n`,
+			);
+	}
+	// The tab-registration dance is asynchronous under the hood (split/buffer
+	// updates are queued) — without the delays the flip back to Terminal 1
+	// can be processed before Terminal 2's display ever registers, and the
+	// closeSplit then destroys the buffer (symptom: no Terminal 2 tab).
+	if (shell.splitId !== null && workShell.splitId !== null) {
+		editor.setSplitBuffer(shell.splitId, workShell.bufferId);
+		await editor.delay(250);
+		editor.setSplitBuffer(shell.splitId, shell.bufferId);
+		await editor.delay(250);
+		editor.closeSplit(workShell.splitId);
+		await editor.delay(250);
+		if (!editor.listBuffers().some((b) => b.id === workShell.bufferId))
+			editor.debug("init.ts: Terminal 2 buffer lost after closeSplit");
+	}
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
 	// ── Diff highlights ──────────────────────────────────────────────────
@@ -258,9 +300,35 @@ fi
 	editor.writeFile(queue, "");
 	// Foreground, output visible — the shell doubles as the watcher log;
 	// open another terminal (+ on the tab bar) for shell work.
+	//
+	// With tmux available, ONE typed line hops the shell into tmux AND
+	// launches the watcher inside it:
+	//   exec tmux new-session -A -s fresh ';' send-keys -t fresh '<watch>' Enter
+	// Why this shape (each part is load-bearing):
+	// - tmux at all: raw-mode TUI that parses all pty input, so the mouse
+	//   escape sequences fresh leaks into the focused pane (fresh 0.4.x
+	//   parser desync on split sequences) are consumed, not echoed as ^[[M
+	//   garbage at the prompt.
+	// - TYPED, not spawned via createTerminal's command: a directly-spawned
+	//   tmux client dies if any stray byte reaches it before it finishes
+	//   attaching; typed input just buffers in the pty until zsh runs it.
+	// - ONE line, chained with tmux's ';': a second typed line could be
+	//   slurped into zsh's line editor together with the first and lost at
+	//   the exec. send-keys is executed by tmux after new-session attaches,
+	//   and tmux buffers it into the pane's pty, so the watcher command
+	//   waits for the inner shell's prompt instead of racing it.
+	// - exec: quitting tmux closes the pane, no leftover outer zsh.
+	// - -A -s fresh: one persistent named session — the shell (and anything
+	//   running in it) survives fresh restarts. The wrapper pre-clears a
+	//   reattached session's stale watcher server-side (send-keys C-c), so
+	//   the prompt is free to take the new watcher command.
+	const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
+	const watchCmd = `fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}`;
 	editor.sendTerminalInput(
 		shell.terminalId,
-		`fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}\n`,
+		tmuxBin
+			? `exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh ';' send-keys -t fresh '${watchCmd}' Enter\n`
+			: `${watchCmd}\n`,
 	);
 	let seen = 0;
 	let lastOpened = "";
