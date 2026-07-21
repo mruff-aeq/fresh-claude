@@ -373,4 +373,23 @@ fi
 	} catch (e) {
 		editor.debug(`init.ts: open-queue watch failed: ${e}`);
 	}
+
+	// ── Stale-tab sweep ──────────────────────────────────────────────────
+	// Deletions normally arrive as fswatch Removed events through the queue
+	// (closeGoneBuffer above), but a large git checkout/branch switch can
+	// coalesce or drop events — and the watcher may be down mid-relaunch —
+	// leaving tabs whose files no longer exist. Safety net: stat every open
+	// file tab in the workspace every few seconds and close the gone ones.
+	(async () => {
+		for (;;) {
+			await editor.delay(3000);
+			for (const b of editor.listBuffers()) {
+				if (b.is_virtual || !b.path) continue;
+				if (!b.path.startsWith(CWD + "/")) continue;
+				if (editor.fileExists(b.path)) continue;
+				closeGoneBuffer(b.path);
+				if (b.path === lastOpened) lastOpened = "";
+			}
+		}
+	})();
 })();
