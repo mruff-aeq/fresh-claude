@@ -12,6 +12,10 @@ if [[ -z "$dir" && -f "$config_file" ]]; then
 	dir="$(<"$config_file")"
 fi
 dir="${dir:-$PWD}"
+if [[ "$(cd "$dir" && pwd -P)" == "$(cd "$HOME" && pwd -P)" ]]; then
+	echo "fresh-claude: refusing to launch in home directory — cd into a project or pass a workspace dir" >&2
+	exit 1
+fi
 cd "$dir"
 
 # Explorer width must come from fresh's project config layer:
