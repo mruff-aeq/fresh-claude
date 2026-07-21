@@ -112,20 +112,27 @@ _pending = {}                   # path -> [first_seen, last_seen]
 _fresh_pid = None
 
 
-def sampler():
-    """Poll the process subtree; stamp _last_test_seen while a runner is up."""
+def loop(qf):
+    """Single control loop: sample the process subtree AND flush debounced
+    paths, one tick every SAMPLE seconds.
+
+    The ps sampling backs off to IDLE_SAMPLE when nothing is pending — the
+    only reason to sample while idle is a runner that dies inside fswatch's
+    ~1s delivery latency (its writes arrive as events just after it exits),
+    and a once-a-second stamp still catches any runner that lived that long.
+    """
     global _last_test_seen
+    IDLE_SAMPLE = max(SAMPLE, 1.0)
+    next_ps = 0.0
     while True:
-        procs = ps_snapshot()
-        if _fresh_pid is not None and test_runner_alive(_fresh_pid, procs):
-            with _lock:
-                _last_test_seen = time.monotonic()
-        time.sleep(SAMPLE)
-
-
-def flusher(qf):
-    """Emit each path once it has been quiet for DEBOUNCE seconds."""
-    while True:
+        now = time.monotonic()
+        with _lock:
+            has_pending = bool(_pending)
+        if _fresh_pid is not None and now >= next_ps:
+            if test_runner_alive(_fresh_pid, ps_snapshot()):
+                with _lock:
+                    _last_test_seen = time.monotonic()
+            next_ps = now + (SAMPLE if has_pending else IDLE_SAMPLE)
         now = time.monotonic()
         ready = []
         with _lock:
@@ -136,7 +143,7 @@ def flusher(qf):
             last_test = _last_test_seen
         for path, first in ready:
             decide(path, first, last_test, qf)
-        time.sleep(0.1)
+        time.sleep(SAMPLE)
 
 
 def decide(path, first_seen, last_test, qf):
@@ -177,8 +184,7 @@ def main():
 
     qf = open(queue, "a", buffering=1)
 
-    threading.Thread(target=sampler, daemon=True).start()
-    threading.Thread(target=flusher, args=(qf,), daemon=True).start()
+    threading.Thread(target=loop, args=(qf,), daemon=True).start()
 
     # -E: extended regex so the (a|b) alternations actually match.
     # Created/Updated feed opens; Removed/Renamed/Moved* let init.ts close tabs
