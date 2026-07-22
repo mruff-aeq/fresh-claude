@@ -203,6 +203,8 @@ def main():
             "--exclude",
             r"/(dist|build|coverage|__pycache__|\.pytest_cache|\.nuxt|\.output|\.fresh)(/|$)",
             "--exclude", r"(package-lock\.json|pnpm-lock\.yaml|poetry\.lock)$",
+            # Claude Code rewrites this on every permission approval — noise.
+            "--exclude", r"/\.claude/settings\.local\.json$",
             "--exclude", r"\.(log|tmp)$",
             root,
         ],
