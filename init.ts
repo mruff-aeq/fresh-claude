@@ -263,9 +263,19 @@ fi
 		if (editorSplitId !== undefined) {
 			const split = editor.listSplits().find((s) => s.splitId === editorSplitId);
 			if (split && split.bufferId === gone) {
+				// Any other live file tab beats an empty pane. Buffers with a
+				// workspace path count even when flagged is_virtual (restored
+				// tabs can be lazily materialized); terminal buffers stay
+				// excluded because their backing paths live outside CWD.
 				const other = editor
 					.listBuffers()
-					.filter((b) => b.id !== gone && !b.is_virtual && b.path && editor.fileExists(b.path))
+					.filter(
+						(b) =>
+							b.id !== gone &&
+							b.path &&
+							(!b.is_virtual || b.path.startsWith(CWD + "/")) &&
+							editor.fileExists(b.path),
+					)
 					.pop();
 				if (other) {
 					editor.setSplitBuffer(editorSplitId, other.id);
