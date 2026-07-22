@@ -18,6 +18,19 @@ if [[ "$(cd "$dir" && pwd -P)" == "$(cd "$HOME" && pwd -P)" ]]; then
 fi
 cd "$dir"
 
+# Per-workspace tmux session name. The names used to be the fixed `fresh` /
+# `fresh-shell`, and `new-session -A` on a fixed name made a second
+# fresh-claude in another directory ATTACH to the first instance's sessions
+# (mirrored terminals), while the stale-watcher C-c below killed the first
+# instance's live watcher. Hashing the canonical workspace path keeps the
+# wanted persistence — relaunching in the SAME dir reattaches that dir's
+# sessions — while concurrent instances stay disjoint. Sanitized basename
+# in front so `tmux ls` stays readable.
+ws_base="$(basename "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')"
+ws_base="${ws_base%-}"
+FRESH_TMUX_SESSION="fresh-${ws_base}-$(pwd -P | cksum | cut -d' ' -f1)"
+export FRESH_TMUX_SESSION
+
 # Explorer width must come from fresh's project config layer:
 # editor.setSetting("file_explorer.width", ...) updates the value but the
 # explorer never re-layouts from it (fresh 0.4.x). show_hidden makes the
@@ -53,12 +66,15 @@ export FRESH_CLAUDE_BIN
 FRESH_TMUX_BIN="$(command -v tmux || true)"
 export FRESH_TMUX_BIN
 
-# The tmux session is persistent (-A -s fresh): a relaunch reattaches a pane
-# that may still be running the previous launch's watcher, with a stale queue
-# path. Interrupt it server-side BEFORE fresh starts — no attached-client
-# races. At an idle prompt the C-c is a no-op.
-if [[ -n "$FRESH_TMUX_BIN" ]] && "$FRESH_TMUX_BIN" has-session -t fresh 2>/dev/null; then
-	"$FRESH_TMUX_BIN" send-keys -t fresh C-c
+# The tmux session is persistent (-A): a relaunch in this dir reattaches a
+# pane that may still be running the previous launch's watcher, with a stale
+# queue path. Interrupt it server-side BEFORE fresh starts — no
+# attached-client races. At an idle prompt the C-c is a no-op. `=` forces an
+# exact-name match so the "-shell" session can never be prefix-matched.
+if [[ -n "$FRESH_TMUX_BIN" ]] && "$FRESH_TMUX_BIN" has-session -t "=$FRESH_TMUX_SESSION" 2>/dev/null; then
+	# send-keys needs a pane target: "=name" alone fails, "=name:" resolves
+	# to the session's active pane.
+	"$FRESH_TMUX_BIN" send-keys -t "=$FRESH_TMUX_SESSION:" C-c
 fi
 export FRESH_PROFILE=claude
 

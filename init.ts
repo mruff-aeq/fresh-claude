@@ -56,7 +56,9 @@ fi
 
 	// Only one split exists at startup — that's the editor pane. Remember it
 	// so the shell split below can target it instead of Claude's split.
-	const editorSplitId = editor.listSplits()[0]?.splitId;
+	// `let`: the split DIES when its last file tab is closed (fresh collapses
+	// an empty split), and ensureEditorSplit below rebuilds + reassigns it.
+	let editorSplitId = editor.listSplits()[0]?.splitId;
 
 	// Right pane, full height: Claude Code spawned directly in the PTY.
 	// Full path via FRESH_CLAUDE_BIN (set by fresh-claude) — the PTY child
@@ -93,11 +95,15 @@ fi
 	// tab directly in the FOCUSED split — no throwaway split needed. It
 	// returns no terminalId, so catch the new terminal's first
 	// terminal_output event (the id not already known) to type the tmux
-	// line. Its own persistent tmux session (fresh-shell) — same
+	// line. Its own persistent per-workspace tmux session — same
 	// leak-eating rationale as below, but a plain `exec` typed line
 	// suffices: nothing else types into this pane, so there is no
 	// stale-watcher or multi-line race to manage. sendTerminalInput just
 	// buffers in the pty, so racing zsh's startup is fine.
+	// FRESH_TMUX_SESSION comes from the wrapper (workspace-path-derived):
+	// fixed names made concurrent fresh-claude instances attach to each
+	// other's sessions via -A (mirrored terminals).
+	const tmuxSession = editor.getEnv("FRESH_TMUX_SESSION") || "fresh";
 	{
 		const knownTerms = new Set([claudeTerm.terminalId, shell.terminalId]);
 		let term2Seen = false;
@@ -108,7 +114,7 @@ fi
 			if (tmuxBin)
 				editor.sendTerminalInput(
 					args.terminal_id,
-					`exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh-shell\n`,
+					`exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession + "-shell")}\n`,
 				);
 		});
 		if (shell.splitId !== null) editor.focusSplit(shell.splitId);
@@ -299,7 +305,7 @@ fi
 	//
 	// With tmux available, ONE typed line hops the shell into tmux AND
 	// launches the watcher inside it:
-	//   exec tmux new-session -A -s fresh ';' send-keys -t fresh '<watch>' Enter
+	//   exec tmux new-session -A -s <sess> ';' send-keys -t '=<sess>:' '<watch>' Enter
 	// Why this shape (each part is load-bearing):
 	// - tmux at all: raw-mode TUI that parses all pty input, so the mouse
 	//   escape sequences fresh leaks into the focused pane (fresh 0.4.x
@@ -314,20 +320,76 @@ fi
 	//   and tmux buffers it into the pane's pty, so the watcher command
 	//   waits for the inner shell's prompt instead of racing it.
 	// - exec: quitting tmux closes the pane, no leftover outer zsh.
-	// - -A -s fresh: one persistent named session — the shell (and anything
-	//   running in it) survives fresh restarts. The wrapper pre-clears a
-	//   reattached session's stale watcher server-side (send-keys C-c), so
-	//   the prompt is free to take the new watcher command.
+	// - -A -s <sess>: one persistent session PER WORKSPACE (name from the
+	//   wrapper via FRESH_TMUX_SESSION) — the shell (and anything running in
+	//   it) survives fresh restarts in the same dir, while concurrent
+	//   instances in other dirs get their own sessions instead of attaching
+	//   to this one. The wrapper pre-clears a reattached session's stale
+	//   watcher server-side (send-keys C-c), so the prompt is free to take
+	//   the new watcher command. `=` in the send-keys target forces exact
+	//   name match (never prefix-matching the "-shell" session).
 	const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
 	const watchCmd = `fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}`;
 	editor.sendTerminalInput(
 		shell.terminalId,
 		tmuxBin
-			? `exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh ';' send-keys -t fresh '${watchCmd}' Enter\n`
+			? `exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession)} ';' send-keys -t ${JSON.stringify("=" + tmuxSession + ":")} '${watchCmd}' Enter\n`
 			: `${watchCmd}\n`,
 	);
 	let seen = 0;
 	let lastOpened = "";
+	// Closing the last file tab makes fresh collapse the editor split (the
+	// shell split expands into its area) — openFileInSplit against the dead
+	// id then returns true but shows nothing. Rebuild on demand, hanging a
+	// new split off the shell split. There is no create-empty-split API and
+	// split_horizontal clones the focused split's ACTIVE view into the new
+	// split — so make that view a fresh empty [No Name] buffer first (the
+	// "new" action): unlike terminal buffers, which no plugin API can strip
+	// from a tab bar (closeBuffer/closeTerminal/close_terminal all leave the
+	// tab), an unmodified [No Name] closes cleanly, taking its tab out of
+	// BOTH splits once the file tab holds the new split open. No
+	// setSplitRatio on the result — it panics fresh 0.4.x ("ContainerId
+	// points to a leaf"), so the rebuilt layout stays 50/50.
+	async function ensureEditorSplit(): Promise<number | undefined> {
+		const alive = editor.listSplits().map((s) => s.splitId);
+		if (editorSplitId !== undefined && alive.includes(editorSplitId))
+			return editorSplitId;
+		if (shell.splitId === null || !alive.includes(shell.splitId)) {
+			editor.debug("init.ts: editor split gone and shell split unavailable — cannot rebuild");
+			return undefined;
+		}
+		const prevFocus = editor.getActiveSplitId();
+		const bufsBefore = new Set(editor.listBuffers().map((b) => b.id));
+		editor.focusSplit(shell.splitId);
+		editor.executeAction("new");
+		await editor.delay(250);
+		const noName = editor.listBuffers().find((b) => !bufsBefore.has(b.id));
+		editor.executeAction("split_horizontal");
+		await editor.delay(250);
+		const born = editor
+			.listSplits()
+			.map((s) => s.splitId)
+			.filter((id) => !alive.includes(id));
+		// Put the shell split back on Terminal 1 whatever happened.
+		editor.setSplitBuffer(shell.splitId, shell.bufferId);
+		if (born.length !== 1 || noName === undefined) {
+			editor.focusSplit(prevFocus);
+			editor.debug(
+				`init.ts: editor-split rebuild failed (new splits: ${born.length}, placeholder: ${noName?.id})`,
+			);
+			return undefined;
+		}
+		editorSplitId = born[0];
+		placeholderBufferId = noName.id;
+		// Focus the reborn editor split — prevFocus is usually the DEAD
+		// split (that death is why we're here), and a focusSplit no-op
+		// leaves focus on the shell split, where the subsequent file open
+		// leaks an extra tab into the terminal strip.
+		editor.focusSplit(editorSplitId);
+		await editor.delay(100);
+		return editorSplitId;
+	}
+	let placeholderBufferId: number | null = null;
 	// Open only when the file actually differs from the launch snapshot — a
 	// file rewritten back to its baseline (checkout/merge/revert) produces a
 	// watcher event with an empty diff, and opening that is pure clutter.
@@ -338,12 +400,51 @@ fi
 				if (!editor.fileExists(path)) return;
 				const ranges = await changedLineRanges(path);
 				const changed = ranges === null || ranges === "all" || ranges.length > 0;
-				if (changed && editorSplitId !== undefined && path !== lastOpened) {
+				// Land on the first highlighted line — in a long file the edit
+				// is often far below the top, and opening at line 0 shows no
+				// green at all. Only on (re)open, so an edit to the file the
+				// user is already viewing never yanks their scroll position.
+				const firstLine =
+					ranges !== null && ranges !== "all" && ranges.length > 0
+						? ranges[0][0] - 1
+						: 0;
+				// lastOpened only suppresses refocus-spam while the tab is
+				// actually open — after a manual tab close the buffer is gone
+				// and the file must reopen (lastOpened alone went stale here:
+				// nothing resets it on close, only on delete).
+				const alreadyOpen = !!editor.findBufferByPath(path);
+				const target =
+					changed && (!alreadyOpen || path !== lastOpened)
+						? await ensureEditorSplit()
+						: undefined;
+				if (target !== undefined) {
 					lastOpened = path;
-					editor.openFileInSplit(editorSplitId, path, 0, 0);
+					editor.openFileInSplit(target, path, firstLine, 0);
 				}
 				const bufId = editor.findBufferByPath(path);
-				if (bufId) await highlightDiff(path, bufId, ranges);
+				if (bufId) {
+					if (target !== undefined && placeholderBufferId !== null) {
+						// Rebuild placeholder: the file tab holds the split
+						// open now, so the [No Name] buffer (and its tab, in
+						// both splits) can go.
+						const tmp = placeholderBufferId;
+						placeholderBufferId = null;
+						await editor.delay(250);
+						if (!editor.closeBuffer(tmp))
+							editor.debug("init.ts: rebuild placeholder buffer refused to close");
+						// KNOWN QUIRK: closing the placeholder backfills its
+						// slot in the SHELL split's strip with the just-opened
+						// file, leaving a duplicate file tab next to the
+						// terminals. Cosmetic only — its × closes it — and not
+						// fixable from the plugin API: there is no detach-tab
+						// primitive, closeOtherBuffersInSplit refuses buffers
+						// shown in another split, and recency games don't
+						// steer the backfill.
+					}
+					await highlightDiff(path, bufId, ranges);
+					if (target !== undefined && firstLine > 0)
+						editor.scrollToLineCenter(target, bufId, firstLine);
+				}
 			})
 			.catch((e) => editor.debug(`init.ts: open+highlight failed: ${e}`));
 	}
