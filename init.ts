@@ -63,7 +63,7 @@ fi
 	// skips the login shell, so PATH may not contain claude.
 	// focus:false keeps focus on the editor split so the next split lands under it.
 	const claudeBin = editor.getEnv("FRESH_CLAUDE_BIN") || "claude";
-	await editor.createTerminal({
+	const claudeTerm = await editor.createTerminal({
 		direction: "vertical",
 		ratio: 0.5,
 		command: [claudeBin],
@@ -88,42 +88,38 @@ fi
 	// typed line does both, see the comment there.)
 
 	// Second terminal as a TAB next to Terminal 1: the watcher occupies
-	// Terminal 1's foreground, so this one is for actual shell work. There
-	// is no create-as-tab API — createTerminal always splits — so: create it
-	// in a throwaway split, DISPLAY its buffer in the shell split (which
-	// registers it as a tab there), flip the shell split back to Terminal 1,
-	// and only then close the throwaway split. Closing first loses the
-	// buffer (verified: the tab never appears) — a buffer only survives a
-	// split close while some split still owns it. Its own persistent tmux
-	// session (fresh-shell) — same leak-eating rationale as below, but a
-	// plain `exec` typed line suffices: nothing else types into this pane,
-	// so there is no stale-watcher or multi-line race to manage.
-	const workShell = await editor.createTerminal({
-		direction: "vertical",
-		ratio: 0.5,
-		focus: false,
-	});
+	// Terminal 1's foreground, so this one is for actual shell work. The
+	// open_terminal action (what the tab bar "+" runs) creates a terminal
+	// tab directly in the FOCUSED split — no throwaway split needed. It
+	// returns no terminalId, so catch the new terminal's first
+	// terminal_output event (the id not already known) to type the tmux
+	// line. Its own persistent tmux session (fresh-shell) — same
+	// leak-eating rationale as below, but a plain `exec` typed line
+	// suffices: nothing else types into this pane, so there is no
+	// stale-watcher or multi-line race to manage. sendTerminalInput just
+	// buffers in the pty, so racing zsh's startup is fine.
 	{
-		const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
-		if (tmuxBin)
-			editor.sendTerminalInput(
-				workShell.terminalId,
-				`exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh-shell\n`,
-			);
-	}
-	// The tab-registration dance is asynchronous under the hood (split/buffer
-	// updates are queued) — without the delays the flip back to Terminal 1
-	// can be processed before Terminal 2's display ever registers, and the
-	// closeSplit then destroys the buffer (symptom: no Terminal 2 tab).
-	if (shell.splitId !== null && workShell.splitId !== null) {
-		editor.setSplitBuffer(shell.splitId, workShell.bufferId);
+		const knownTerms = new Set([claudeTerm.terminalId, shell.terminalId]);
+		let term2Seen = false;
+		editor.on("terminal_output", (args) => {
+			if (term2Seen || knownTerms.has(args.terminal_id)) return;
+			term2Seen = true;
+			const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
+			if (tmuxBin)
+				editor.sendTerminalInput(
+					args.terminal_id,
+					`exec ${JSON.stringify(tmuxBin)} new-session -A -s fresh-shell\n`,
+				);
+		});
+		if (shell.splitId !== null) editor.focusSplit(shell.splitId);
+		const bufsBefore = new Set(editor.listBuffers().map((b) => b.id));
+		editor.executeAction("open_terminal");
+		// The new tab lands foreground; give the (queued) buffer updates a
+		// beat, then flip the split back to Terminal 1 for the watcher.
 		await editor.delay(250);
-		editor.setSplitBuffer(shell.splitId, shell.bufferId);
-		await editor.delay(250);
-		editor.closeSplit(workShell.splitId);
-		await editor.delay(250);
-		if (!editor.listBuffers().some((b) => b.id === workShell.bufferId))
-			editor.debug("init.ts: Terminal 2 buffer lost after closeSplit");
+		if (!editor.listBuffers().some((b) => !bufsBefore.has(b.id)))
+			editor.debug("init.ts: open_terminal produced no Terminal 2 buffer");
+		if (shell.splitId !== null) editor.setSplitBuffer(shell.splitId, shell.bufferId);
 	}
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
