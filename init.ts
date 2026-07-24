@@ -84,9 +84,10 @@ fi
 	// lazily — only expanded ones are listed, so big trees stay cheap.
 	const expanded = new Set([CWD]);
 
-	// Artifacts state: path → { status: "new" | "modified" | "unknown" |
-	// "deleted", added: lines }. Insertion order is oldest-first; rendering
-	// reverses it, and updates re-insert, so the newest change sits on top.
+	// Artifacts state: path → { status: "new" | "modified" | "unknown",
+	// added: lines }. Insertion order is oldest-first; rendering reverses it,
+	// and updates re-insert, so the newest change sits on top. Deleted files
+	// are dropped from the map entirely.
 	const artifacts = new Map();
 
 	function relPath(p: string): string {
@@ -177,13 +178,11 @@ fi
 			if (!open) continue;
 			for (const { path, a } of items) {
 				const tag =
-					a.status === "deleted"
-						? "deleted"
-						: a.status === "new"
-							? "new"
-							: a.status === "unknown"
-								? "changed"
-								: `+${a.added}`;
+					a.status === "new"
+						? "new"
+						: a.status === "unknown"
+							? "changed"
+							: `+${a.added}`;
 				const name = dir === "./" ? relPath(path) : relPath(path).slice(dir.length);
 				out.push({
 					text: `  ● ${name}  (${tag})\n`,
@@ -659,15 +658,10 @@ fi
 			.catch((e) => editor.debug(`init.ts: artifact update failed: ${e}`));
 	}
 
-	// A deleted file stays listed, marked (deleted) — the panel is a log of
-	// what happened since launch, and silently vanishing entries read as a
-	// glitch. Its tab (if any) still closes via closeGoneBuffer.
-	function markDeleted(path: string) {
-		const a = artifacts.get(path);
-		if (a === undefined) return;
-		artifacts.delete(path);
-		artifacts.set(path, { ...a, status: "deleted" });
-		renderArtifactsPanel();
+	// A deleted file's entry is dropped — a dead artifact opens nothing, so
+	// listing it is clutter. Its tab (if any) still closes via closeGoneBuffer.
+	function dropArtifact(path: string) {
+		if (artifacts.delete(path)) renderArtifactsPanel();
 	}
 
 	// Open a panel entry in the editor split, landing on the first changed
@@ -817,7 +811,7 @@ fi
 					// files don't linger after Claude cleans them up, and
 					// mark the artifact entry.
 					closeGoneBuffer(p);
-					markDeleted(p);
+					dropArtifact(p);
 					scheduleTreeRefresh();
 					if (p === lastPreview) lastPreview = "";
 					continue;
@@ -844,7 +838,7 @@ fi
 				if (!b.path.startsWith(CWD + "/")) continue;
 				if (editor.fileExists(b.path)) continue;
 				closeGoneBuffer(b.path);
-				markDeleted(b.path);
+				dropArtifact(b.path);
 				if (b.path === lastPreview) lastPreview = "";
 			}
 		}

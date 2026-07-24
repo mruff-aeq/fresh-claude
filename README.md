@@ -17,7 +17,7 @@ One command opens:
 Any file created or modified in the workspace — by Claude Code, git, or
 anything else — is broadcast to the **Artifacts** panel (bottom-left), a
 newest-first log of what changed since launch: `● path (+12)` for edits,
-`(new)` for created files, `(deleted)` for removed ones. Nothing opens as a
+`(new)` for created files. Nothing opens as a
 tab on its own — click an entry (or press Enter on it) to open the file in
 the editor pane, scrolled to the first change, with every line that differs
 from launch painted green. Files created since launch are painted whole
@@ -36,7 +36,7 @@ about the code, not the test output. Files whose content ends up identical
 to how it was at launch (e.g. rewritten back by a revert or a checkout) are
 dropped from the panel — no diff, no entry. When a file is deleted (say, a
 temp script Claude cleaned up), its tab closes automatically and its
-Artifacts entry is marked `(deleted)`.
+Artifacts entry disappears.
 
 ## Requirements
 
