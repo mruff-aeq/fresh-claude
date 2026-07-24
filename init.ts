@@ -2,8 +2,14 @@
 // Only active when launched via the fresh-claude wrapper (FRESH_PROFILE=claude);
 // plain `fresh` is untouched. Installed to ~/.config/fresh/init.ts.
 //
-// Layout: file explorer | editor (+ shell below) | Claude Code right, full height.
-// Changed files anywhere in the workspace open as tabs in the top editor split.
+// Layout: [file tree / Artifacts] | editor (+ shell below) | Claude Code right.
+// The left column is two stacked virtual-buffer panels (the built-in file
+// explorer cannot host a second panel below it, so it stays hidden and the
+// tree is rendered by this script): a lazy file tree on top, and an
+// "Artifacts" panel below listing every file changed since launch. Changed
+// files are BROADCAST to the Artifacts panel instead of auto-opening as tabs;
+// clicking (or pressing Enter on) an entry opens the file in the editor pane
+// with changed lines highlighted green.
 
 (async () => {
 	if (editor.getEnv("FRESH_PROFILE") !== "claude") return;
@@ -48,26 +54,197 @@ fi
 		editor.debug(`init.ts: workspace snapshot error: ${e}`);
 	}
 
-	// Show the file explorer sidebar (hidden by default on a fresh workspace).
-	// Width comes from .fresh/config.json in the project dir — setSetting
-	// updates the value but the explorer never re-layouts from it.
-	await editor.delay(100);
-	editor.executeAction("toggle_file_explorer");
+	// ── Left column: file tree + Artifacts panels ────────────────────────
+	// Same dir skip-list as the snapshot — the tree is for source, not vendored
+	// churn.
+	const EXCLUDE_DIRS = new Set([
+		".git",
+		"node_modules",
+		".venv",
+		"venv",
+		"dist",
+		"build",
+		"coverage",
+		"__pycache__",
+		".pytest_cache",
+		".nuxt",
+		".output",
+		".fresh",
+	]);
 
-	// Only one split exists at startup — that's the editor pane. Remember it
-	// so the shell split below can target it instead of Claude's split.
-	// `let`: the split DIES when its last file tab is closed (fresh collapses
-	// an empty split), and ensureEditorSplit below rebuilds + reassigns it.
-	let editorSplitId = editor.listSplits()[0]?.splitId;
+	// Pane ratios. COLUMN_RATIO is the share the editor+Claude region keeps
+	// (the left column gets the rest); the others match the old layout.
+	const COLUMN_RATIO = 0.8;
+	const ARTIFACTS_RATIO = 0.5; // tree/artifacts split the column 50/50
+	const CLAUDE_RATIO = 0.5;
+	const SHELL_RATIO = 0.75;
 
-	// Right pane, full height: Claude Code spawned directly in the PTY.
-	// Full path via FRESH_CLAUDE_BIN (set by fresh-claude) — the PTY child
-	// skips the login shell, so PATH may not contain claude.
-	// focus:false keeps focus on the editor split so the next split lands under it.
+	// Tree state: which dirs are expanded (root always is). Dirs are read
+	// lazily — only expanded ones are listed, so big trees stay cheap.
+	const expanded = new Set([CWD]);
+
+	// Artifacts state: path → { status: "new" | "modified" | "unknown" |
+	// "deleted", added: lines }. Insertion order is oldest-first; rendering
+	// reverses it, and updates re-insert, so the newest change sits on top.
+	const artifacts = new Map();
+
+	function relPath(p: string): string {
+		return p.startsWith(CWD + "/") ? p.slice(CWD.length + 1) : p;
+	}
+
+	function treeEntries() {
+		const out: Array<{ text: string; properties: Record<string, unknown> }> = [];
+		const walk = (dir: string, depth: number) => {
+			let entries;
+			try {
+				entries = editor.readDir(dir);
+			} catch (e) {
+				editor.debug(`init.ts: readDir(${dir}) failed: ${e}`);
+				return;
+			}
+			entries = entries.filter((en) => !(en.is_dir && EXCLUDE_DIRS.has(en.name)));
+			entries.sort((a, b) =>
+				a.is_dir !== b.is_dir
+					? a.is_dir
+						? -1
+						: 1
+					: a.name.localeCompare(b.name, undefined, {
+							numeric: true,
+							sensitivity: "base",
+						}),
+			);
+			for (const en of entries) {
+				const full = dir + "/" + en.name;
+				const pad = "  ".repeat(depth);
+				if (en.is_dir) {
+					const open = expanded.has(full);
+					out.push({
+						text: `${pad}${open ? "▾" : "▸"} ${en.name}/\n`,
+						properties: { path: full, is_dir: true },
+					});
+					if (open) walk(full, depth + 1);
+				} else {
+					out.push({
+						text: `${pad}  ${en.name}\n`,
+						properties: { path: full, is_dir: false },
+					});
+				}
+			}
+		};
+		walk(CWD, 0);
+		if (out.length === 0) out.push({ text: "(empty)\n", properties: {} });
+		return out;
+	}
+
+	function artifactEntries() {
+		if (artifacts.size === 0)
+			return [{ text: "(no changes yet)\n", properties: {} }];
+		return [...artifacts.entries()].reverse().map(([path, a]) => {
+			const tag =
+				a.status === "deleted"
+					? "deleted"
+					: a.status === "new"
+						? "new"
+						: a.status === "unknown"
+							? "changed"
+							: `+${a.added}`;
+			return {
+				text: `● ${relPath(path)}  (${tag})\n`,
+				properties: { path, is_dir: false },
+			};
+		});
+	}
+
+	// Modes must exist before the buffers that use them. Both panels share one
+	// activate command: Enter toggles a folder or opens a file.
+	editor.defineMode("fc-tree", "special", [["Return", "fc_activate"]], true);
+	editor.defineMode("fc-artifacts", "special", [["Return", "fc_activate"]], true);
+
+	// Build the column off the single startup split. New panes land RIGHT
+	// (vertical) / BELOW (horizontal) of the current one, so the tree buffer
+	// is born in the wide right pane and then buffer-swapped into the narrow
+	// left pane — there is no way to ask for a left-hand split directly.
+	const s0 = editor.listSplits()[0];
+	const tree = await editor.createVirtualBufferInSplit({
+		name: "*Files*",
+		mode: "fc-tree",
+		read_only: true,
+		entries: treeEntries(),
+		ratio: COLUMN_RATIO,
+		direction: "vertical",
+		panel_id: "fc-tree",
+		show_line_numbers: false,
+		editing_disabled: true,
+	});
+	const treeBufId: number = tree.buffer_id;
+	// `let`: the editor split DIES when its last tab is closed (fresh
+	// collapses an empty split); ensureEditorSplit below rebuilds + reassigns.
+	let editorSplitId: number | undefined;
+	let treeSplitId: number | undefined;
+	if (tree.split_id !== null && tree.split_id !== undefined && s0 !== undefined) {
+		editor.setSplitBuffer(s0.splitId, treeBufId);
+		editor.setSplitBuffer(tree.split_id, s0.bufferId);
+		treeSplitId = s0.splitId;
+		editorSplitId = tree.split_id;
+	} else {
+		// No split materialized — degrade to the old single-column layout.
+		editor.debug("init.ts: tree split creation failed; left column disabled");
+		editorSplitId = s0?.splitId;
+	}
+
+	let artifactsBufId: number | null = null;
+	if (treeSplitId !== undefined) {
+		editor.focusSplit(treeSplitId);
+		try {
+			const art = await editor.createVirtualBufferInSplit({
+				name: "*Artifacts*",
+				mode: "fc-artifacts",
+				read_only: true,
+				entries: artifactEntries(),
+				ratio: ARTIFACTS_RATIO,
+				direction: "horizontal",
+				panel_id: "fc-artifacts",
+				show_line_numbers: false,
+				editing_disabled: true,
+			});
+			artifactsBufId = art.buffer_id;
+		} catch (e) {
+			editor.debug(`init.ts: artifacts panel creation failed: ${e}`);
+		}
+	}
+	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
+
+	function refreshArtifactsPanel() {
+		if (artifactsBufId !== null)
+			editor.setVirtualBufferContent(artifactsBufId, artifactEntries());
+	}
+
+	// Tree refreshes are debounced — a git checkout can queue hundreds of
+	// watcher events, and one re-render after the burst settles is enough.
+	let treeRefreshPending = false;
+	function scheduleTreeRefresh() {
+		if (treeRefreshPending || treeSplitId === undefined) return;
+		treeRefreshPending = true;
+		(async () => {
+			await editor.delay(500);
+			treeRefreshPending = false;
+			try {
+				editor.setVirtualBufferContent(treeBufId, treeEntries());
+			} catch (e) {
+				editor.debug(`init.ts: tree refresh failed: ${e}`);
+			}
+		})();
+	}
+
+	// Right pane, full height of the editor region: Claude Code spawned
+	// directly in the PTY. Full path via FRESH_CLAUDE_BIN (set by
+	// fresh-claude) — the PTY child skips the login shell, so PATH may not
+	// contain claude. focus:false keeps focus on the editor split so the next
+	// split lands under it.
 	const claudeBin = editor.getEnv("FRESH_CLAUDE_BIN") || "claude";
 	const claudeTerm = await editor.createTerminal({
 		direction: "vertical",
-		ratio: 0.5,
+		ratio: CLAUDE_RATIO,
 		command: [claudeBin],
 		title: "Claude Code",
 		focus: false,
@@ -82,7 +259,7 @@ fi
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 	const shell = await editor.createTerminal({
 		direction: "horizontal",
-		ratio: 0.75,
+		ratio: SHELL_RATIO,
 		focus: false,
 	});
 
@@ -131,7 +308,7 @@ fi
 
 	// ── Diff highlights ──────────────────────────────────────────────────
 	// Paint a background on every line that differs from the launch snapshot,
-	// so a tab that pops open makes it obvious WHAT changed, not just that it
+	// so an opened artifact makes it obvious WHAT changed, not just that it
 	// did. Files new since launch are painted whole. Baseline is the snapshot
 	// mirror captured above — no git required, works in any directory.
 	const DIFF_NS = "fresh-claude-diff";
@@ -265,8 +442,8 @@ fi
 			if (split && split.bufferId === gone) {
 				// Any other live file tab beats an empty pane. Buffers with a
 				// workspace path count even when flagged is_virtual (restored
-				// tabs can be lazily materialized); terminal buffers stay
-				// excluded because their backing paths live outside CWD.
+				// tabs can be lazily materialized); terminal and panel buffers
+				// stay excluded because they have no workspace-relative path.
 				const other = editor
 					.listBuffers()
 					.filter(
@@ -302,12 +479,13 @@ fi
 		if (p) scheduleHighlight(p);
 	});
 
-	// Auto-open edited files as tabs in the TOP editor split.
+	// ── Watcher → Artifacts broadcast ────────────────────────────────────
 	// fswatch (in the bottom shell — fresh's own recursive watchPath dies
-	// with EMFILE on big trees) appends changed paths to a queue file;
-	// we watch that single file and open each new entry in editorSplitId.
-	// Queue lives OUTSIDE the watched tree (unique per launch) so the
-	// watcher can never see its own queue writes and loop.
+	// with EMFILE on big trees) appends changed paths to a queue file; we
+	// watch that single file and record each entry in the Artifacts panel
+	// (no auto-opened tabs — opening is a click away). Queue lives OUTSIDE
+	// the watched tree (unique per launch) so the watcher can never see its
+	// own queue writes and loop.
 	const queue = `/tmp/fresh-open-queue-${Date.now()}`;
 	editor.writeFile(queue, "");
 	// Foreground, output visible — the shell doubles as the watcher log;
@@ -347,7 +525,6 @@ fi
 			: `${watchCmd}\n`,
 	);
 	let seen = 0;
-	let lastOpened = "";
 	// Closing the last file tab makes fresh collapse the editor split (the
 	// shell split expands into its area) — openFileInSplit against the dead
 	// id then returns true but shows nothing. Rebuild on demand, hanging a
@@ -400,40 +577,72 @@ fi
 		return editorSplitId;
 	}
 	let placeholderBufferId: number | null = null;
-	// Open only when the file actually differs from the launch snapshot — a
-	// file rewritten back to its baseline (checkout/merge/revert) produces a
-	// watcher event with an empty diff, and opening that is pure clutter.
-	// "all" (new since launch) and null (over cap / outside workspace) open.
-	function scheduleOpenAndHighlight(path: string) {
+
+	function sumAdded(ranges: Array<[number, number]>): number {
+		return ranges.reduce((n, [a, b]) => n + (b - a + 1), 0);
+	}
+
+	// Record a changed file in the Artifacts panel. A file rewritten back to
+	// its baseline (checkout/merge/revert) produces an empty diff — that
+	// DROPS the artifact entry instead of listing noise, and clears any stale
+	// highlight if the file happens to be open. "all" (new since launch) and
+	// null (over cap / no baseline) are listed.
+	function scheduleArtifact(path: string) {
 		diffChain = diffChain
 			.then(async () => {
 				if (!editor.fileExists(path)) return;
 				const ranges = await changedLineRanges(path);
-				const changed = ranges === null || ranges === "all" || ranges.length > 0;
-				// Land on the first highlighted line — in a long file the edit
-				// is often far below the top, and opening at line 0 shows no
-				// green at all. Only on (re)open, so an edit to the file the
-				// user is already viewing never yanks their scroll position.
+				if (ranges !== null && ranges !== "all" && ranges.length === 0) {
+					if (artifacts.delete(path)) refreshArtifactsPanel();
+					const bufId = editor.findBufferByPath(path);
+					if (bufId) editor.clearNamespace(bufId, DIFF_NS);
+					return;
+				}
+				const status =
+					ranges === "all" ? "new" : ranges === null ? "unknown" : "modified";
+				const added = ranges !== null && ranges !== "all" ? sumAdded(ranges) : 0;
+				artifacts.delete(path); // re-insert → newest-first render order
+				artifacts.set(path, { status, added });
+				refreshArtifactsPanel();
+				scheduleTreeRefresh(); // a created file should appear in the tree
+				const bufId = editor.findBufferByPath(path);
+				if (bufId) await highlightDiff(path, bufId, ranges);
+			})
+			.catch((e) => editor.debug(`init.ts: artifact update failed: ${e}`));
+	}
+
+	// A deleted file stays listed, marked (deleted) — the panel is a log of
+	// what happened since launch, and silently vanishing entries read as a
+	// glitch. Its tab (if any) still closes via closeGoneBuffer.
+	function markDeleted(path: string) {
+		const a = artifacts.get(path);
+		if (a === undefined) return;
+		artifacts.delete(path);
+		artifacts.set(path, { ...a, status: "deleted" });
+		refreshArtifactsPanel();
+	}
+
+	// Open a panel entry in the editor split, landing on the first changed
+	// line — in a long file the edit is often far below the top, and opening
+	// at line 0 shows no green at all.
+	function scheduleOpen(path: string) {
+		diffChain = diffChain
+			.then(async () => {
+				if (!editor.fileExists(path)) {
+					editor.debug(`init.ts: open skipped, file gone: ${path}`);
+					return;
+				}
+				const ranges = await changedLineRanges(path);
 				const firstLine =
 					ranges !== null && ranges !== "all" && ranges.length > 0
 						? ranges[0][0] - 1
 						: 0;
-				// lastOpened only suppresses refocus-spam while the tab is
-				// actually open — after a manual tab close the buffer is gone
-				// and the file must reopen (lastOpened alone went stale here:
-				// nothing resets it on close, only on delete).
-				const alreadyOpen = !!editor.findBufferByPath(path);
-				const target =
-					changed && (!alreadyOpen || path !== lastOpened)
-						? await ensureEditorSplit()
-						: undefined;
-				if (target !== undefined) {
-					lastOpened = path;
-					editor.openFileInSplit(target, path, firstLine, 0);
-				}
+				const target = await ensureEditorSplit();
+				if (target === undefined) return;
+				editor.openFileInSplit(target, path, firstLine, 0);
 				const bufId = editor.findBufferByPath(path);
 				if (bufId) {
-					if (target !== undefined && placeholderBufferId !== null) {
+					if (placeholderBufferId !== null) {
 						// Rebuild placeholder: the file tab holds the split
 						// open now, so the [No Name] buffer (and its tab, in
 						// both splits) can go.
@@ -452,12 +661,62 @@ fi
 						// steer the backfill.
 					}
 					await highlightDiff(path, bufId, ranges);
-					if (target !== undefined && firstLine > 0)
-						editor.scrollToLineCenter(target, bufId, firstLine);
+					if (firstLine > 0) editor.scrollToLineCenter(target, bufId, firstLine);
 				}
 			})
 			.catch((e) => editor.debug(`init.ts: open+highlight failed: ${e}`));
 	}
+
+	// ── Panel activation ─────────────────────────────────────────────────
+	// Enter (bound in both panel modes): toggle a folder, open a file.
+	globalThis.fcActivate = () => {
+		const splitId = editor.getActiveSplitId();
+		const split = editor.listSplits().find((s) => s.splitId === splitId);
+		if (!split) return;
+		const bufId = split.bufferId;
+		if (bufId !== treeBufId && bufId !== artifactsBufId) return;
+		const props = editor.getTextPropertiesAtCursor(bufId);
+		const p = props && props.length > 0 ? props[0] : null;
+		if (!p || !p.path) return;
+		const path = String(p.path);
+		if (p.is_dir) {
+			if (expanded.has(path)) expanded.delete(path);
+			else expanded.add(path);
+			editor.setVirtualBufferContent(treeBufId, treeEntries());
+		} else {
+			scheduleOpen(path);
+		}
+	};
+	// No context arg — the command must stay executable from both panel modes.
+	editor.registerCommand(
+		"fc_activate",
+		"Open file / toggle folder (fresh-claude panels)",
+		"fcActivate",
+	);
+
+	// Click-to-open: there is no mouse event in the plugin API, but a click
+	// moves the cursor into the clicked panel line, which fires cursor_moved.
+	// Files open on any cursor landing (click OR arrow-key scan — same
+	// preview feel as the built-in explorer); folders only toggle on Enter,
+	// so arrowing through the tree doesn't flap them. Payload shape is
+	// undocumented — extract the buffer id defensively and bail quietly.
+	let lastPreview = "";
+	editor.on("cursor_moved", (args) => {
+		const bid =
+			args && typeof args === "object"
+				? (args.buffer_id ?? args.bufferId)
+				: undefined;
+		if (typeof bid !== "number") return;
+		if (bid !== treeBufId && bid !== artifactsBufId) return;
+		const props = editor.getTextPropertiesAtCursor(bid);
+		const p = props && props.length > 0 ? props[0] : null;
+		if (!p || !p.path || p.is_dir) return;
+		const path = String(p.path);
+		if (path === lastPreview) return;
+		lastPreview = path;
+		scheduleOpen(path);
+	});
+
 	try {
 		const queueHandle = await editor.watchPath(queue, false);
 		editor.on("path_changed", (args) => {
@@ -468,12 +727,15 @@ fi
 			for (const p of lines.slice(seen)) {
 				if (!editor.fileExists(p)) {
 					// Deleted or renamed away — close the stale tab so temp
-					// files don't linger after Claude cleans them up.
+					// files don't linger after Claude cleans them up, and
+					// mark the artifact entry.
 					closeGoneBuffer(p);
-					if (p === lastOpened) lastOpened = "";
+					markDeleted(p);
+					scheduleTreeRefresh();
+					if (p === lastPreview) lastPreview = "";
 					continue;
 				}
-				scheduleOpenAndHighlight(p);
+				scheduleArtifact(p);
 			}
 			seen = lines.length;
 		});
@@ -495,7 +757,8 @@ fi
 				if (!b.path.startsWith(CWD + "/")) continue;
 				if (editor.fileExists(b.path)) continue;
 				closeGoneBuffer(b.path);
-				if (b.path === lastOpened) lastOpened = "";
+				markDeleted(b.path);
+				if (b.path === lastPreview) lastPreview = "";
 			}
 		}
 	})();

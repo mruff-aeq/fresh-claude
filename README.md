@@ -7,26 +7,36 @@ One command opens:
 ```
 ┌──────────┬──────────────────────────┬──────────────────────┐
 │ File     │  editor (tabs)           │  Claude Code         │
-│ Explorer │                          │  (full height)       │
-│          ├──────────────────────────┤                      │
+│ Tree     │                          │  (full height)       │
+├──────────┤                          │                      │
+│ Artifacts├──────────────────────────┤                      │
 │          │  shell                   │                      │
 └──────────┴──────────────────────────┴──────────────────────┘
 ```
 
 Any file created or modified in the workspace — by Claude Code, git, or
-anything else — automatically opens as a tab in the editor pane, so you can
-watch what Claude is doing while it works. The dozens of temp files a test
-run drops mid-execution are filtered out: while a test runner is alive in the
-editor's process subtree, files appearing in the tree are treated as churn
-and skipped, so the tab bar stays about the code, not the test output. Files
-whose content ends up identical to how it was at launch (e.g. rewritten back
-by a revert or a checkout) are skipped too — no diff, no tab. Lines that
-differ from launch get a green background, so it's obvious *what* changed in
-each file, not just that it did — files created since launch are painted
-whole (everything is new). The baseline is a snapshot of the workspace taken
-when fresh-claude starts, so this works in any directory, git or not.
-When a file is deleted (say, a temp script Claude cleaned up), its tab
-closes automatically instead of lingering.
+anything else — is broadcast to the **Artifacts** panel (bottom-left), a
+newest-first log of what changed since launch: `● path (+12)` for edits,
+`(new)` for created files, `(deleted)` for removed ones. Nothing opens as a
+tab on its own — click an entry (or press Enter on it) to open the file in
+the editor pane, scrolled to the first change, with every line that differs
+from launch painted green. Files created since launch are painted whole
+(everything is new). The baseline is a snapshot of the workspace taken when
+fresh-claude starts, so this works in any directory, git or not.
+
+The top-left panel is a custom file tree (fresh's built-in explorer can't
+host a second panel below it, so init.ts renders its own): Enter or click
+opens files, Enter toggles folders, heavy dirs (`node_modules`, `.git`, …)
+are skipped, and directories are read lazily so big trees stay cheap.
+
+The dozens of temp files a test run drops mid-execution are filtered out:
+while a test runner is alive in the editor's process subtree, files appearing
+in the tree are treated as churn and skipped, so the Artifacts panel stays
+about the code, not the test output. Files whose content ends up identical
+to how it was at launch (e.g. rewritten back by a revert or a checkout) are
+dropped from the panel — no diff, no entry. When a file is deleted (say, a
+temp script Claude cleaned up), its tab closes automatically and its
+Artifacts entry is marked `(deleted)`.
 
 ## Requirements
 
@@ -70,15 +80,17 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
 ## How it works
 
 - **`bin/fresh-claude`** — sets `FRESH_PROFILE=claude`, resolves the `claude`
-  binary for the PTY, seeds `.fresh/config.json` (explorer width) in the
-  workspace, and runs `fresh --no-restore`.
+  binary for the PTY, and runs `fresh --no-restore`.
 - **`init.ts`** — fresh auto-runs this at startup. When the profile is active
   it first mirrors the workspace into a per-launch `/tmp` snapshot (the
   highlight baseline, captured before Claude can edit anything; heavy dirs and
-  files over 1 MB are skipped). Then it opens the explorer, spawns Claude Code
-  in a right-hand vertical split and a shell below the editor, and starts the
-  watcher, opening each queued file that differs from the snapshot in the top
-  editor split via `openFileInSplit`. For each opened or changed file it runs
+  files over 1 MB are skipped). Then it builds the left column — a custom
+  file tree and the Artifacts panel, both read-only virtual buffers with
+  Enter/click bound to open-or-toggle — spawns Claude Code in a right-hand
+  vertical split and a shell below the editor, and starts the watcher.
+  Each queued file that differs from the snapshot is recorded in the
+  Artifacts panel; opening happens only on click/Enter, via
+  `openFileInSplit`. For each opened or changed file it runs
   `git diff --no-index -U0 <snapshot> <file>` (no repo required) and paints the
   added/modified lines with a buffer overlay (namespace `fresh-claude-diff`);
   highlights refresh on every watcher event, file open, and tab switch, so
@@ -106,15 +118,12 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
 
 ## Tuning
 
-- **Explorer width**: `.fresh/config.json` in the workspace —
-  `"width": "28"` (columns) or `"15%"`. Must live in a config file; the
-  `setSetting` plugin API doesn't re-layout the explorer (fresh 0.4.x).
-- **Hidden files**: the wrapper seeds `"show_hidden": true` into each
-  workspace's `.fresh/config.json` (dotfiles visible in the explorer). Set
-  it to `false` there to hide them again — the wrapper won't override an
-  existing value. `"respect_gitignore": false` also shows gitignored files.
-- **Pane sizes**: `ratio` values in `~/.config/fresh/init.ts` — `0.5` for the
-  Claude split, `0.25` for the shell.
+- **Pane sizes**: the ratio constants at the top of the layout section in
+  `~/.config/fresh/init.ts` — `COLUMN_RATIO` (0.8: editor+Claude region keeps
+  80%, the tree/Artifacts column gets 20%), `ARTIFACTS_RATIO` (0.5: tree and
+  Artifacts split their column evenly), `CLAUDE_RATIO`, `SHELL_RATIO`.
+- **Tree skip-list**: `EXCLUDE_DIRS` in `init.ts` — dirs hidden from the
+  custom file tree (mirrors the snapshot excludes). Dotfiles are shown.
 - **Watcher ignore list**: `--exclude` patterns in `bin/fresh-watch-open`
   (extended regex — keep the `-E` flag, without it the alternations silently
   match nothing). These are a cheap first-pass filter; the test-churn
@@ -137,16 +146,24 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
   the one init.ts builds — the wrapper always passes it.
 - Hot-exit buffers (unsaved files) survive `--no-restore` by design; close
   stray tabs once and they stay gone.
-- Bulk file churn in a non-ignored path opens one tab per file — but only
-  for files that actually differ from the launch snapshot afterwards, so a
-  revert/checkout that rewrites a file back to its baseline opens nothing, and
-  files written while a test runner is alive are suppressed.
+- Bulk file churn in a non-ignored path lists one Artifacts entry per file —
+  but only for files that actually differ from the launch snapshot, so a
+  revert/checkout that rewrites a file back to its baseline lists nothing
+  (and drops any existing entry), and files written while a test runner is
+  alive are suppressed.
 - Changed-line highlights are relative to the **launch snapshot**, not git —
   they show what changed since fresh-claude started, in any directory. A file
-  edited, then reverted to its launch content, loses its highlights. Files
-  over 1 MB and the excluded heavy dirs are not snapshotted, so they get tabs
-  but no highlights. The snapshot is per-launch, so restarting fresh-claude
-  re-baselines everything to the current on-disk state.
+  edited, then reverted to its launch content, loses its highlights and its
+  Artifacts entry. Files over 1 MB and the excluded heavy dirs are not
+  snapshotted, so they get `(changed)` entries but no highlights. The
+  snapshot is per-launch, so restarting fresh-claude re-baselines everything
+  to the current on-disk state.
+- There is no mouse event in the plugin API — click-to-open rides on the
+  cursor landing in the panel line (`cursor_moved`). Arrow-keying through the
+  tree therefore also opens files as you go (same preview feel as the
+  built-in explorer); folders only toggle on Enter.
+- The panels can't be rebuilt if you close their buffers; restart
+  fresh-claude to get them back.
 
 ## Uninstall
 
