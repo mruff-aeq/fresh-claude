@@ -119,9 +119,9 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
 ## Tuning
 
 - **Pane sizes**: the ratio constants at the top of the layout section in
-  `~/.config/fresh/init.ts` — `COLUMN_RATIO` (0.8: editor+Claude region keeps
-  80%, the tree/Artifacts column gets 20%), `ARTIFACTS_RATIO` (0.5: tree and
-  Artifacts split their column evenly), `CLAUDE_RATIO`, `SHELL_RATIO`.
+  `~/.config/fresh/init.ts` — `COLUMN_RATIO` (0.2: the tree/Artifacts column
+  gets 20% of the width), `ARTIFACTS_RATIO` (0.5: tree and Artifacts split
+  their column evenly), `CLAUDE_RATIO`, `SHELL_RATIO`.
 - **Tree skip-list**: `EXCLUDE_DIRS` in `init.ts` — dirs hidden from the
   custom file tree (mirrors the snapshot excludes). Dotfiles are shown.
 - **Watcher ignore list**: `--exclude` patterns in `bin/fresh-watch-open`

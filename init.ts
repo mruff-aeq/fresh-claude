@@ -72,9 +72,10 @@ fi
 		".fresh",
 	]);
 
-	// Pane ratios. COLUMN_RATIO is the share the editor+Claude region keeps
-	// (the left column gets the rest); the others match the old layout.
-	const COLUMN_RATIO = 0.8;
+	// Pane ratios. COLUMN_RATIO is the tree/Artifacts column's share of the
+	// width (the editor+Claude region gets the rest) — if a fresh update flips
+	// the ratio's meaning, set 0.8. The others match the old layout.
+	const COLUMN_RATIO = 0.2;
 	const ARTIFACTS_RATIO = 0.5; // tree/artifacts split the column 50/50
 	const CLAUDE_RATIO = 0.5;
 	const SHELL_RATIO = 0.75;
@@ -157,57 +158,51 @@ fi
 
 	// Modes must exist before the buffers that use them. Both panels share one
 	// activate command: Enter toggles a folder or opens a file.
-	editor.defineMode("fc-tree", "special", [["Return", "fc_activate"]], true);
-	editor.defineMode("fc-artifacts", "special", [["Return", "fc_activate"]], true);
+	// inheritNormalBindings: arrows/PageUp/etc must still navigate the panels.
+	editor.defineMode("fc-tree", [["Return", "fc_activate"]], true, false, true);
+	editor.defineMode("fc-artifacts", [["Return", "fc_activate"]], true, false, true);
 
-	// Build the column off the single startup split. New panes land RIGHT
-	// (vertical) / BELOW (horizontal) of the current one, so the tree buffer
-	// is born in the wide right pane and then buffer-swapped into the narrow
-	// left pane — there is no way to ask for a left-hand split directly.
+	// Build the column off the single startup split. `before: true` places
+	// the new pane LEFT of the editor pane directly.
 	const s0 = editor.listSplits()[0];
-	const tree = await editor.createVirtualBufferInSplit({
-		name: "*Files*",
-		mode: "fc-tree",
-		read_only: true,
-		entries: treeEntries(),
-		ratio: COLUMN_RATIO,
-		direction: "vertical",
-		panel_id: "fc-tree",
-		show_line_numbers: false,
-		editing_disabled: true,
-	});
-	const treeBufId: number = tree.buffer_id;
 	// `let`: the editor split DIES when its last tab is closed (fresh
 	// collapses an empty split); ensureEditorSplit below rebuilds + reassigns.
-	let editorSplitId: number | undefined;
+	let editorSplitId: number | undefined = s0?.splitId;
 	let treeSplitId: number | undefined;
-	if (tree.split_id !== null && tree.split_id !== undefined && s0 !== undefined) {
-		editor.setSplitBuffer(s0.splitId, treeBufId);
-		editor.setSplitBuffer(tree.split_id, s0.bufferId);
-		treeSplitId = s0.splitId;
-		editorSplitId = tree.split_id;
-	} else {
-		// No split materialized — degrade to the old single-column layout.
-		editor.debug("init.ts: tree split creation failed; left column disabled");
-		editorSplitId = s0?.splitId;
+	let treeBufId: number | null = null;
+	let artifactsBufId: number | null = null;
+	try {
+		const tree = await editor.createVirtualBufferInSplit({
+			name: "*Files*",
+			mode: "fc-tree",
+			readOnly: true,
+			entries: treeEntries(),
+			ratio: COLUMN_RATIO,
+			direction: "vertical",
+			before: true,
+			showLineNumbers: false,
+			editingDisabled: true,
+		});
+		treeBufId = tree.bufferId;
+		treeSplitId = tree.splitId ?? undefined;
+	} catch (e) {
+		editor.debug(`init.ts: tree panel creation failed; left column disabled: ${e}`);
 	}
 
-	let artifactsBufId: number | null = null;
 	if (treeSplitId !== undefined) {
 		editor.focusSplit(treeSplitId);
 		try {
 			const art = await editor.createVirtualBufferInSplit({
 				name: "*Artifacts*",
 				mode: "fc-artifacts",
-				read_only: true,
+				readOnly: true,
 				entries: artifactEntries(),
 				ratio: ARTIFACTS_RATIO,
 				direction: "horizontal",
-				panel_id: "fc-artifacts",
-				show_line_numbers: false,
-				editing_disabled: true,
+				showLineNumbers: false,
+				editingDisabled: true,
 			});
-			artifactsBufId = art.buffer_id;
+			artifactsBufId = art.bufferId;
 		} catch (e) {
 			editor.debug(`init.ts: artifacts panel creation failed: ${e}`);
 		}
@@ -223,7 +218,7 @@ fi
 	// watcher events, and one re-render after the burst settles is enough.
 	let treeRefreshPending = false;
 	function scheduleTreeRefresh() {
-		if (treeRefreshPending || treeSplitId === undefined) return;
+		if (treeRefreshPending || treeBufId === null) return;
 		treeRefreshPending = true;
 		(async () => {
 			await editor.delay(500);
@@ -682,7 +677,7 @@ fi
 		if (p.is_dir) {
 			if (expanded.has(path)) expanded.delete(path);
 			else expanded.add(path);
-			editor.setVirtualBufferContent(treeBufId, treeEntries());
+			if (treeBufId !== null) editor.setVirtualBufferContent(treeBufId, treeEntries());
 		} else {
 			scheduleOpen(path);
 		}
@@ -695,20 +690,20 @@ fi
 	);
 
 	// Click-to-open: there is no mouse event in the plugin API, but a click
-	// moves the cursor into the clicked panel line, which fires cursor_moved.
-	// Files open on any cursor landing (click OR arrow-key scan — same
-	// preview feel as the built-in explorer); folders only toggle on Enter,
-	// so arrowing through the tree doesn't flap them. Payload shape is
-	// undocumented — extract the buffer id defensively and bail quietly.
+	// moves the cursor into the clicked panel line, which fires cursor_moved
+	// (payload: buffer_id, line, text_properties). Files open on any cursor
+	// landing (click OR arrow-key scan — same preview feel as the built-in
+	// explorer); folders only toggle on Enter, so arrowing through the tree
+	// doesn't flap them.
 	let lastPreview = "";
 	editor.on("cursor_moved", (args) => {
-		const bid =
-			args && typeof args === "object"
-				? (args.buffer_id ?? args.bufferId)
-				: undefined;
+		const bid = args?.buffer_id;
 		if (typeof bid !== "number") return;
 		if (bid !== treeBufId && bid !== artifactsBufId) return;
-		const props = editor.getTextPropertiesAtCursor(bid);
+		const props =
+			Array.isArray(args.text_properties) && args.text_properties.length > 0
+				? args.text_properties
+				: editor.getTextPropertiesAtCursor(bid);
 		const p = props && props.length > 0 ? props[0] : null;
 		if (!p || !p.path || p.is_dir) return;
 		const path = String(p.path);
