@@ -27,7 +27,7 @@ Claude Code IDE layout for [fresh](https://getfresh.dev) terminal editor. One co
 
 - [fresh](https://getfresh.dev) 0.4.x — `brew install sinelaw/fresh/fresh`
 - [fswatch](https://github.com/emcrisostomo/fswatch) — `brew install fswatch`
-- python3, git
+- python3, git, rsync
 - [Claude Code](https://claude.com/claude-code)
 - Nerd Font in terminal (for folder chevrons)
 - macOS or Linux
