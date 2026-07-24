@@ -158,10 +158,10 @@ Plain `fresh` is unaffected — the layout only activates when the wrapper sets
   snapshotted, so they get `(changed)` entries but no highlights. The
   snapshot is per-launch, so restarting fresh-claude re-baselines everything
   to the current on-disk state.
-- There is no mouse event in the plugin API — click-to-open rides on the
-  cursor landing in the panel line (`cursor_moved`). Arrow-keying through the
-  tree therefore also opens files as you go (same preview feel as the
-  built-in explorer); folders only toggle on Enter.
+- Clicks resolve through the `mouse_click` hook (folders toggle, files
+  open); arrow-keying through the tree also opens files as you go (same
+  preview feel as the built-in explorer) via `cursor_moved`, but folders
+  never toggle from the cursor alone — only click or Enter.
 - The panels can't be rebuilt if you close their buffers; restart
   fresh-claude to get them back.
 

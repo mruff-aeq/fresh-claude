@@ -156,6 +156,24 @@ fi
 		});
 	}
 
+	// Rendered-entry mirrors of what each panel currently displays, indexed by
+	// line — mouse_click reports a buffer_row, and this is how a click row is
+	// resolved back to a path (text properties are only queryable at the
+	// CURSOR, which a click may not have moved yet).
+	let treeRendered: ReturnType<typeof treeEntries> = [];
+	let artifactsRendered: ReturnType<typeof artifactEntries> = [];
+	function renderTreePanel() {
+		treeRendered = treeEntries();
+		if (treeBufId !== null) editor.setVirtualBufferContent(treeBufId, treeRendered);
+		return treeRendered;
+	}
+	function renderArtifactsPanel() {
+		artifactsRendered = artifactEntries();
+		if (artifactsBufId !== null)
+			editor.setVirtualBufferContent(artifactsBufId, artifactsRendered);
+		return artifactsRendered;
+	}
+
 	// Modes must exist before the buffers that use them. Both panels share one
 	// activate command: Enter toggles a folder or opens a file.
 	// inheritNormalBindings: arrows/PageUp/etc must still navigate the panels.
@@ -176,7 +194,7 @@ fi
 			name: "*Files*",
 			mode: "fc-tree",
 			readOnly: true,
-			entries: treeEntries(),
+			entries: (treeRendered = treeEntries()),
 			ratio: COLUMN_RATIO,
 			direction: "vertical",
 			before: true,
@@ -196,7 +214,7 @@ fi
 				name: "*Artifacts*",
 				mode: "fc-artifacts",
 				readOnly: true,
-				entries: artifactEntries(),
+				entries: (artifactsRendered = artifactEntries()),
 				ratio: ARTIFACTS_RATIO,
 				direction: "horizontal",
 				showLineNumbers: false,
@@ -209,10 +227,6 @@ fi
 	}
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
-	function refreshArtifactsPanel() {
-		if (artifactsBufId !== null)
-			editor.setVirtualBufferContent(artifactsBufId, artifactEntries());
-	}
 
 	// Tree refreshes are debounced — a git checkout can queue hundreds of
 	// watcher events, and one re-render after the burst settles is enough.
@@ -224,7 +238,7 @@ fi
 			await editor.delay(500);
 			treeRefreshPending = false;
 			try {
-				editor.setVirtualBufferContent(treeBufId, treeEntries());
+				renderTreePanel();
 			} catch (e) {
 				editor.debug(`init.ts: tree refresh failed: ${e}`);
 			}
@@ -588,7 +602,7 @@ fi
 				if (!editor.fileExists(path)) return;
 				const ranges = await changedLineRanges(path);
 				if (ranges !== null && ranges !== "all" && ranges.length === 0) {
-					if (artifacts.delete(path)) refreshArtifactsPanel();
+					if (artifacts.delete(path)) renderArtifactsPanel();
 					const bufId = editor.findBufferByPath(path);
 					if (bufId) editor.clearNamespace(bufId, DIFF_NS);
 					return;
@@ -598,7 +612,7 @@ fi
 				const added = ranges !== null && ranges !== "all" ? sumAdded(ranges) : 0;
 				artifacts.delete(path); // re-insert → newest-first render order
 				artifacts.set(path, { status, added });
-				refreshArtifactsPanel();
+				renderArtifactsPanel();
 				scheduleTreeRefresh(); // a created file should appear in the tree
 				const bufId = editor.findBufferByPath(path);
 				if (bufId) await highlightDiff(path, bufId, ranges);
@@ -614,7 +628,7 @@ fi
 		if (a === undefined) return;
 		artifacts.delete(path);
 		artifacts.set(path, { ...a, status: "deleted" });
-		refreshArtifactsPanel();
+		renderArtifactsPanel();
 	}
 
 	// Open a panel entry in the editor split, landing on the first changed
@@ -677,7 +691,7 @@ fi
 		if (p.is_dir) {
 			if (expanded.has(path)) expanded.delete(path);
 			else expanded.add(path);
-			if (treeBufId !== null) editor.setVirtualBufferContent(treeBufId, treeEntries());
+			renderTreePanel();
 		} else {
 			scheduleOpen(path);
 		}
@@ -689,13 +703,36 @@ fi
 		"fcActivate",
 	);
 
-	// Click-to-open: there is no mouse event in the plugin API, but a click
-	// moves the cursor into the clicked panel line, which fires cursor_moved
-	// (payload: buffer_id, line, text_properties). Files open on any cursor
-	// landing (click OR arrow-key scan — same preview feel as the built-in
-	// explorer); folders only toggle on Enter, so arrowing through the tree
-	// doesn't flap them.
+	// Click handling: mouse_click reports the clicked buffer_row directly, so
+	// a click on a folder line toggles it (Enter works too) — cursor_moved
+	// can't do this, since arrow-keying through the tree would flap every
+	// folder it passes. Clicked files also open here (dedup via lastPreview:
+	// the same click usually fires cursor_moved as well).
 	let lastPreview = "";
+	editor.on("mouse_click", (args) => {
+		if (args?.button !== "left") return;
+		const bid = args.buffer_id;
+		const row = args.buffer_row;
+		if (typeof bid !== "number" || typeof row !== "number") return;
+		const rendered =
+			bid === treeBufId ? treeRendered : bid === artifactsBufId ? artifactsRendered : null;
+		if (rendered === null) return;
+		const p = rendered[row]?.properties;
+		if (!p || !p.path) return;
+		const path = String(p.path);
+		if (p.is_dir) {
+			if (expanded.has(path)) expanded.delete(path);
+			else expanded.add(path);
+			renderTreePanel();
+		} else if (path !== lastPreview) {
+			lastPreview = path;
+			scheduleOpen(path);
+		}
+	});
+
+	// Arrow-key scan: cursor landing on a file line opens it (same preview
+	// feel as the built-in explorer); folders are ignored here — they toggle
+	// only via click or Enter.
 	editor.on("cursor_moved", (args) => {
 		const bid = args?.buffer_id;
 		if (typeof bid !== "number") return;
