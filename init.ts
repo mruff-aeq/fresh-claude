@@ -353,6 +353,16 @@ fi
 	}
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
+	// ── Focus indicator: amber active tab ────────────────────────────────
+	// The active-tab background is overridden to one loud amber — the tab of
+	// the pane you're typing into is unmistakable at a glance. Flat dot-key —
+	// the host expects `{"ui.tab_active_bg": [r,g,b]}`, NOT the nested
+	// theme-file shape (that variant is silently ignored). Set once; the
+	// override survives until an applyTheme call.
+	const FOCUS_TAB_BG: [number, number, number] = [122, 62, 8];
+	if (!editor.overrideThemeColors({ "ui.tab_active_bg": FOCUS_TAB_BG }))
+		editor.debug("init.ts: overrideThemeColors refused tab_active_bg");
+
 	// ── Diff highlights ──────────────────────────────────────────────────
 	// Paint a background on every line that differs from the launch snapshot,
 	// so an opened artifact makes it obvious WHAT changed, not just that it
