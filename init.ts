@@ -119,8 +119,10 @@ fi
 				const pad = "  ".repeat(depth);
 				if (en.is_dir) {
 					const open = expanded.has(full);
+					// Nerd Font chevrons (as \u escapes so non-NF editors can't
+					// mangle the source): U+F078 chevron-down / U+F054 chevron-right.
 					out.push({
-						text: `${pad}${open ? "▾" : "▸"} ${en.name}/\n`,
+						text: `${pad}${open ? "\uf078" : "\uf054"} ${en.name}/\n`,
 						properties: { path: full, is_dir: true },
 					});
 					if (open) walk(full, depth + 1);
@@ -137,23 +139,50 @@ fi
 		return out;
 	}
 
+	// Artifacts are grouped under one header row per directory (workspace-
+	// relative, "./" for the root), newest-touched group first, newest file
+	// first within a group. Headers collapse/expand on click or Enter,
+	// tracked separately from the file tree's `expanded` set.
+	const artCollapsed = new Set<string>();
+
 	function artifactEntries() {
 		if (artifacts.size === 0)
 			return [{ text: "(no changes yet)\n", properties: {} }];
-		return [...artifacts.entries()].reverse().map(([path, a]) => {
-			const tag =
-				a.status === "deleted"
-					? "deleted"
-					: a.status === "new"
-						? "new"
-						: a.status === "unknown"
-							? "changed"
-							: `+${a.added}`;
-			return {
-				text: `● ${relPath(path)}  (${tag})\n`,
-				properties: { path, is_dir: false },
-			};
-		});
+		// dir → items newest-first; Map keeps first-seen (= newest) group order.
+		const groups = new Map<string, Array<{ path: string; a: any }>>();
+		for (const [path, a] of [...artifacts.entries()].reverse()) {
+			const rel = relPath(path);
+			const cut = rel.lastIndexOf("/");
+			const dir = cut === -1 ? "./" : rel.slice(0, cut + 1);
+			let items = groups.get(dir);
+			if (items === undefined) groups.set(dir, (items = []));
+			items.push({ path, a });
+		}
+		const out: Array<{ text: string; properties: Record<string, unknown> }> = [];
+		for (const [dir, items] of groups) {
+			const open = !artCollapsed.has(dir);
+			out.push({
+				text: `${open ? "\uf078" : "\uf054"} ${dir}  (${items.length})\n`,
+				properties: { group: dir },
+			});
+			if (!open) continue;
+			for (const { path, a } of items) {
+				const tag =
+					a.status === "deleted"
+						? "deleted"
+						: a.status === "new"
+							? "new"
+							: a.status === "unknown"
+								? "changed"
+								: `+${a.added}`;
+				const name = dir === "./" ? relPath(path) : relPath(path).slice(dir.length);
+				out.push({
+					text: `  ● ${name}  (${tag})\n`,
+					properties: { path, is_dir: false },
+				});
+			}
+		}
+		return out;
 	}
 
 	// Rendered-entry mirrors of what each panel currently displays, indexed by
@@ -686,7 +715,15 @@ fi
 		if (bufId !== treeBufId && bufId !== artifactsBufId) return;
 		const props = editor.getTextPropertiesAtCursor(bufId);
 		const p = props && props.length > 0 ? props[0] : null;
-		if (!p || !p.path) return;
+		if (!p) return;
+		if (p.group) {
+			const g = String(p.group);
+			if (artCollapsed.has(g)) artCollapsed.delete(g);
+			else artCollapsed.add(g);
+			renderArtifactsPanel();
+			return;
+		}
+		if (!p.path) return;
 		const path = String(p.path);
 		if (p.is_dir) {
 			if (expanded.has(path)) expanded.delete(path);
@@ -718,7 +755,15 @@ fi
 			bid === treeBufId ? treeRendered : bid === artifactsBufId ? artifactsRendered : null;
 		if (rendered === null) return;
 		const p = rendered[row]?.properties;
-		if (!p || !p.path) return;
+		if (!p) return;
+		if (p.group) {
+			const g = String(p.group);
+			if (artCollapsed.has(g)) artCollapsed.delete(g);
+			else artCollapsed.add(g);
+			renderArtifactsPanel();
+			return;
+		}
+		if (!p.path) return;
 		const path = String(p.path);
 		if (p.is_dir) {
 			if (expanded.has(path)) expanded.delete(path);
