@@ -93,8 +93,14 @@ fi
 		return p.startsWith(CWD + "/") ? p.slice(CWD.length + 1) : p;
 	}
 
+	// Dir rows and file rows get distinct theme-key colors (resolved against
+	// the active theme) in BOTH panels, so the type is readable at a glance:
+	// dirs bold keyword-color, files string-color.
+	const DIR_STYLE = { fg: "syntax.keyword", bold: true };
+	const FILE_STYLE = { fg: "syntax.string" };
+
 	function treeEntries() {
-		const out: Array<{ text: string; properties: Record<string, unknown> }> = [];
+		const out: Array<Record<string, unknown>> = [];
 		const walk = (dir: string, depth: number) => {
 			let entries;
 			try {
@@ -124,12 +130,14 @@ fi
 					out.push({
 						text: `${pad}${open ? "\uf078" : "\uf054"} ${en.name}/\n`,
 						properties: { path: full, is_dir: true },
+						style: DIR_STYLE,
 					});
 					if (open) walk(full, depth + 1);
 				} else {
 					out.push({
 						text: `${pad}  ${en.name}\n`,
 						properties: { path: full, is_dir: false },
+						style: FILE_STYLE,
 					});
 				}
 			}
@@ -158,12 +166,13 @@ fi
 			if (items === undefined) groups.set(dir, (items = []));
 			items.push({ path, a });
 		}
-		const out: Array<{ text: string; properties: Record<string, unknown> }> = [];
+		const out: Array<Record<string, unknown>> = [];
 		for (const [dir, items] of groups) {
 			const open = !artCollapsed.has(dir);
 			out.push({
 				text: `${open ? "\uf078" : "\uf054"} ${dir}  (${items.length})\n`,
 				properties: { group: dir },
+				style: DIR_STYLE,
 			});
 			if (!open) continue;
 			for (const { path, a } of items) {
@@ -179,6 +188,7 @@ fi
 				out.push({
 					text: `  ● ${name}  (${tag})\n`,
 					properties: { path, is_dir: false },
+					style: FILE_STYLE,
 				});
 			}
 		}
