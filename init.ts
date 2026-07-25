@@ -740,7 +740,11 @@ fi
 					const bufId = editor.findBufferByPath(path);
 					// Empty diff through highlightDiff clears highlights AND
 					// any stale red deletion lines.
-					if (bufId) await highlightDiff(path, bufId, diff);
+					if (bufId) {
+						if (!editor.isBufferModified(bufId))
+							await editor.refreshBufferFromDisk(bufId);
+						await highlightDiff(path, bufId, diff);
+					}
 					return;
 				}
 				const status =
@@ -755,7 +759,15 @@ fi
 				renderArtifactsPanel();
 				scheduleTreeRefresh(); // a created file should appear in the tree
 				const bufId = editor.findBufferByPath(path);
-				if (bufId) await highlightDiff(path, bufId, diff);
+				if (bufId) {
+					// The buffer does NOT auto-reload on external writes — a
+					// stale buffer shows old content (and would clobber the
+					// disk state if saved). Refresh unless the user has real
+					// unsaved edits in it.
+					if (!editor.isBufferModified(bufId))
+						await editor.refreshBufferFromDisk(bufId);
+					await highlightDiff(path, bufId, diff);
+				}
 			})
 			.catch((e) => editor.debug(`init.ts: artifact update failed: ${e}`));
 	}
@@ -789,6 +801,8 @@ fi
 				editor.openFileInSplit(target, path, firstLine, 0);
 				const bufId = editor.findBufferByPath(path);
 				if (bufId) {
+					if (!editor.isBufferModified(bufId))
+						await editor.refreshBufferFromDisk(bufId);
 					if (placeholderBufferId !== null) {
 						// Rebuild placeholder: the file tab holds the split
 						// open now, so the [No Name] buffer (and its tab, in
