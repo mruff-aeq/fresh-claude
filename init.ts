@@ -99,6 +99,10 @@ fi
 	// dirs bold keyword-color, files string-color.
 	const DIR_STYLE = { fg: "syntax.keyword", bold: true };
 	const FILE_STYLE = { fg: "syntax.string" };
+	// Deletion accents — shared by the in-file red phantom lines and the
+	// Artifacts "-N" spans. DEL_BG is DIFF_BG's red twin.
+	const DEL_BG: [number, number, number] = [86, 28, 28];
+	const DEL_ACCENT: [number, number, number] = [220, 90, 90];
 
 	function treeEntries() {
 		const out: Array<Record<string, unknown>> = [];
@@ -182,13 +186,32 @@ fi
 						? "new"
 						: a.status === "unknown"
 							? "changed"
-							: `+${a.added}`;
+							: [a.added ? `+${a.added}` : "", a.deleted ? `-${a.deleted}` : ""]
+									.filter(Boolean)
+									.join(" ");
 				const name = dir === "./" ? relPath(path) : relPath(path).slice(dir.length);
-				out.push({
-					text: `  ● ${name}  (${tag})\n`,
+				const head = `  ● ${name}  (`;
+				const entry: Record<string, unknown> = {
+					text: `${head}${tag})\n`,
 					properties: { path, is_dir: false },
 					style: FILE_STYLE,
-				});
+				};
+				// Red accent on the "-N" span, matching the in-file deletion
+				// marker. Offsets in BYTES (the InlineOverlay default unit) via
+				// utf8ByteLength — char units miscount the wide ● glyph and
+				// shift the span; bytes are unambiguous.
+				if (a.deleted && a.status === "modified") {
+					const addPart = a.added ? `+${a.added} ` : "";
+					const start = editor.utf8ByteLength(`${head}${addPart}`);
+					entry.inlineOverlays = [
+						{
+							start,
+							end: start + editor.utf8ByteLength(`-${a.deleted}`),
+							style: { fg: DEL_ACCENT },
+						},
+					];
+				}
+				out.push(entry);
 			}
 		}
 		return out;
@@ -379,13 +402,22 @@ fi
 		return null;
 	}
 
-	// [startLine, endLine] pairs (1-indexed, inclusive) of lines that differ
-	// from the launch snapshot; "all" for files new since launch (no snapshot
-	// entry — everything is new); null when outside the workspace, unreadable,
-	// or over the 1 MB cap (no highlight either way).
+	// Diff of a file vs the launch snapshot. `adds` holds [startLine, endLine]
+	// pairs (1-indexed, inclusive) of surviving lines that differ; `dels`
+	// holds pure deletions — `line` is the NEW-file line number preceding the
+	// removed block (0 when the file's first lines were deleted), `count` how
+	// many lines vanished. "all" = new since launch (no snapshot entry); null
+	// = outside the workspace, unreadable, or over the 1 MB cap.
 	async function changedLineRanges(
 		path: string,
-	): Promise<Array<[number, number]> | "all" | null> {
+	): Promise<
+		| {
+				adds: Array<[number, number]>;
+				dels: Array<{ line: number; count: number; texts: string[] }>;
+		  }
+		| "all"
+		| null
+	> {
 		const snap = snapPathOf(path);
 		if (snap === null) return null;
 		const content = editor.readFile(path);
@@ -402,48 +434,97 @@ fi
 			["diff", "--no-index", "-U0", "--no-color", "--", snap, path],
 			CWD,
 		);
-		if (res.exit_code === 0) return [];
+		if (res.exit_code === 0) return { adds: [], dels: [] };
 		if (res.exit_code > 1 && res.stdout === "") return null;
-		const ranges: Array<[number, number]> = [];
-		const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
-		let m: RegExpExecArray | null;
-		while ((m = hunk.exec(res.stdout)) !== null) {
-			const start = parseInt(m[1], 10);
-			const count = m[2] === undefined ? 1 : parseInt(m[2], 10);
-			if (count > 0) ranges.push([start, start + count - 1]);
+		const adds: Array<[number, number]> = [];
+		const dels: Array<{ line: number; count: number; texts: string[] }> = [];
+		// Walk the diff line-by-line: a pure-deletion hunk (+n,0) is followed
+		// by its removed lines as "-" lines — capture their content so each
+		// can be shown as a red phantom line. Mixed hunks (new count > 0) are
+		// replacements; the green overlay on the surviving lines covers them.
+		const hunkRe = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+		let current: { line: number; count: number; texts: string[] } | null = null;
+		for (const ln of res.stdout.split("\n")) {
+			const m = hunkRe.exec(ln);
+			if (m !== null) {
+				const oldCount = m[1] === undefined ? 1 : parseInt(m[1], 10);
+				const start = parseInt(m[2], 10);
+				const count = m[3] === undefined ? 1 : parseInt(m[3], 10);
+				current = null;
+				if (count > 0) adds.push([start, start + count - 1]);
+				else if (oldCount > 0) {
+					current = { line: start, count: oldCount, texts: [] };
+					dels.push(current);
+				}
+			} else if (current !== null && ln.startsWith("-") && !ln.startsWith("---")) {
+				current.texts.push(ln.slice(1));
+			}
 		}
-		return ranges;
+		return { adds, dels };
 	}
+
+	// Deletions get a red phantom line (virtual — not in the buffer text) at
+	// the removal point, "-" in the gutter, since no surviving line can carry
+	// a green background for them. Styled to mirror the green added-line
+	// look: dim red BACKGROUND (DIFF_BG's red twin), light red accents.
+	const DEL_NS = "fresh-claude-del";
 
 	async function highlightDiff(
 		path: string,
 		bufferId: number,
-		ranges?: Array<[number, number]> | "all" | null,
+		diff?:
+			| { adds: Array<[number, number]>; dels: Array<{ line: number; count: number }> }
+			| "all"
+			| null,
 	) {
-		if (ranges === undefined) ranges = await changedLineRanges(path);
-		if (ranges === null) return;
+		if (diff === undefined) diff = await changedLineRanges(path);
+		if (diff === null) return;
 		editor.clearNamespace(bufferId, DIFF_NS);
 		const content = editor.readFile(path);
 		if (content === null) return;
 		// Both key spellings — the API docs and OverlayOptions disagree.
 		const style = { bg: DIFF_BG, extendToLineEnd: true, extend_to_line_end: true };
 		const total = editor.utf8ByteLength(content);
-		if (ranges === "all") {
+		editor.clearVirtualLinesInRange(bufferId, DEL_NS, 0, total + 1);
+		if (diff === "all") {
 			if (total > 0) editor.addOverlay(bufferId, DIFF_NS, 0, total, style);
 			return;
 		}
-		if (ranges.length === 0) return;
+		const { adds, dels } = diff;
+		if (adds.length === 0 && dels.length === 0) return;
 		const lines = content.split("\n");
 		// starts[i] = byte offset of line i (0-indexed); overlays take bytes.
 		const starts: number[] = [0];
 		for (const line of lines)
 			starts.push(starts[starts.length - 1] + editor.utf8ByteLength(line) + 1);
-		for (const [a, b] of ranges) {
+		for (const [a, b] of adds) {
 			const s = starts[Math.min(a - 1, lines.length - 1)];
 			// End of line b: start of line b+1 minus its "\n" (clamped for a
 			// missing trailing newline on the last line).
 			const e = Math.min(starts[Math.min(b, lines.length)] - 1, total);
 			if (e > s) editor.addOverlay(bufferId, DIFF_NS, s, e, style);
+		}
+		// One red phantom line PER deleted line, showing its old content —
+		// capped per block so a huge deletion can't wallpaper the buffer.
+		const MAX_DEL_LINES = 20;
+		for (const d of dels) {
+			const opts = {
+				fg: [235, 200, 200],
+				bg: DEL_BG,
+				gutterGlyph: "-",
+				gutterColor: DEL_ACCENT,
+			};
+			const shown = d.texts.slice(0, MAX_DEL_LINES);
+			if (shown.length === 0)
+				shown.push(`── ${d.count} line${d.count === 1 ? "" : "s"} deleted ──`);
+			else if (d.texts.length > MAX_DEL_LINES)
+				shown.push(`── … ${d.texts.length - MAX_DEL_LINES} more deleted ──`);
+			// d.line precedes the removed block: phantom lines ABOVE the next
+			// line, or BELOW the last line when the deletion was at EOF.
+			const above = d.line < lines.length;
+			const anchor = above ? starts[d.line] : starts[Math.max(0, lines.length - 1)];
+			for (const text of shown)
+				editor.addVirtualLine(bufferId, anchor, text, opts, above, DEL_NS, 0);
 		}
 	}
 
@@ -648,22 +729,33 @@ fi
 		diffChain = diffChain
 			.then(async () => {
 				if (!editor.fileExists(path)) return;
-				const ranges = await changedLineRanges(path);
-				if (ranges !== null && ranges !== "all" && ranges.length === 0) {
+				const diff = await changedLineRanges(path);
+				if (
+					diff !== null &&
+					diff !== "all" &&
+					diff.adds.length === 0 &&
+					diff.dels.length === 0
+				) {
 					if (artifacts.delete(path)) renderArtifactsPanel();
 					const bufId = editor.findBufferByPath(path);
-					if (bufId) editor.clearNamespace(bufId, DIFF_NS);
+					// Empty diff through highlightDiff clears highlights AND
+					// any stale red deletion lines.
+					if (bufId) await highlightDiff(path, bufId, diff);
 					return;
 				}
 				const status =
-					ranges === "all" ? "new" : ranges === null ? "unknown" : "modified";
-				const added = ranges !== null && ranges !== "all" ? sumAdded(ranges) : 0;
+					diff === "all" ? "new" : diff === null ? "unknown" : "modified";
+				const added = diff !== null && diff !== "all" ? sumAdded(diff.adds) : 0;
+				const deleted =
+					diff !== null && diff !== "all"
+						? diff.dels.reduce((n, d) => n + d.count, 0)
+						: 0;
 				artifacts.delete(path); // re-insert → newest-first render order
-				artifacts.set(path, { status, added });
+				artifacts.set(path, { status, added, deleted });
 				renderArtifactsPanel();
 				scheduleTreeRefresh(); // a created file should appear in the tree
 				const bufId = editor.findBufferByPath(path);
-				if (bufId) await highlightDiff(path, bufId, ranges);
+				if (bufId) await highlightDiff(path, bufId, diff);
 			})
 			.catch((e) => editor.debug(`init.ts: artifact update failed: ${e}`));
 	}
@@ -684,11 +776,14 @@ fi
 					editor.debug(`init.ts: open skipped, file gone: ${path}`);
 					return;
 				}
-				const ranges = await changedLineRanges(path);
-				const firstLine =
-					ranges !== null && ranges !== "all" && ranges.length > 0
-						? ranges[0][0] - 1
-						: 0;
+				const diff = await changedLineRanges(path);
+				let firstLine = 0;
+				if (diff !== null && diff !== "all") {
+					const firstAdd = diff.adds.length > 0 ? diff.adds[0][0] - 1 : Infinity;
+					const firstDel = diff.dels.length > 0 ? diff.dels[0].line : Infinity;
+					const f = Math.min(firstAdd, firstDel);
+					if (f !== Infinity) firstLine = f;
+				}
 				const target = await ensureEditorSplit();
 				if (target === undefined) return;
 				editor.openFileInSplit(target, path, firstLine, 0);
@@ -712,7 +807,7 @@ fi
 						// shown in another split, and recency games don't
 						// steer the backfill.
 					}
-					await highlightDiff(path, bufId, ranges);
+					await highlightDiff(path, bufId, diff);
 					if (firstLine > 0) editor.scrollToLineCenter(target, bufId, firstLine);
 				}
 			})
