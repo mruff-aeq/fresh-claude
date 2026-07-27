@@ -617,6 +617,27 @@ fi
 		if (p) scheduleHighlight(p);
 	});
 
+	// fresh auto-reloads a buffer whose file changed on disk, and the reload
+	// WIPES all plugin overlays — usually right after the watcher-driven
+	// highlight pass has painted them (the reload lands last and wins). The
+	// reload surfaces as lines_changed with the buffer left unmodified, so:
+	// re-highlight on lines_changed, debounced per buffer, skipping buffers
+	// with real unsaved edits (typing also fires this event, but a diff of
+	// DISK content against an edited buffer would paint at stale offsets).
+	const rehlPending = new Set<number>();
+	editor.on("lines_changed", (args) => {
+		const bid = args.buffer_id;
+		if (typeof bid !== "number" || rehlPending.has(bid)) return;
+		const p = editor.getBufferPath(bid);
+		if (!p || !p.startsWith(CWD + "/")) return;
+		rehlPending.add(bid);
+		(async () => {
+			await editor.delay(300);
+			rehlPending.delete(bid);
+			if (!editor.isBufferModified(bid)) scheduleHighlight(p);
+		})();
+	});
+
 	// ── Watcher → Artifacts broadcast ────────────────────────────────────
 	// fswatch (in the bottom shell — fresh's own recursive watchPath dies
 	// with EMFILE on big trees) appends changed paths to a queue file; we
