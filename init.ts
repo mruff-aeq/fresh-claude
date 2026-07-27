@@ -628,10 +628,22 @@ fi
 	// re-highlight on lines_changed, debounced per buffer, skipping buffers
 	// with real unsaved edits (typing also fires this event, but a diff of
 	// DISK content against an edited buffer would paint at stale offsets).
+	//
+	// lines_changed is a RENDER-side event: it also fires when scrolling
+	// merely brings new lines into view. Gate on `epoch` — the buffer
+	// VERSION, which bumps only on real content changes (edits, reload) —
+	// or plain scrolling re-runs the whole clear/re-add highlight pass
+	// right as each scroll settles: visible end-of-scroll jitter plus a
+	// git-diff spawn per scroll.
 	const rehlPending = new Set<number>();
+	const rehlEpoch = new Map<number, number>();
 	editor.on("lines_changed", (args) => {
 		const bid = args.buffer_id;
-		if (typeof bid !== "number" || rehlPending.has(bid)) return;
+		if (typeof bid !== "number") return;
+		const epoch = typeof args.epoch === "number" ? args.epoch : -1;
+		if (rehlEpoch.get(bid) === epoch) return;
+		rehlEpoch.set(bid, epoch);
+		if (rehlPending.has(bid)) return;
 		const p = editor.getBufferPath(bid);
 		if (!p || !p.startsWith(CWD + "/")) return;
 		rehlPending.add(bid);
