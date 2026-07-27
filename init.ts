@@ -358,10 +358,14 @@ fi
 			if (term2Seen || knownTerms.has(args.terminal_id)) return;
 			term2Seen = true;
 			const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
+			// TMUX= : fresh itself now runs inside the wrapper's shield tmux
+			// (see bin/fresh-claude), so this pty inherits TMUX and a bare
+			// tmux would refuse to nest. The inner session targets the
+			// DEFAULT socket, distinct from the shield's -L socket.
 			if (tmuxBin)
 				editor.sendTerminalInput(
 					args.terminal_id,
-					`exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession + "-shell")}\n`,
+					`TMUX= exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession + "-shell")}\n`,
 				);
 		});
 		if (shell.splitId !== null) editor.focusSplit(shell.splitId);
@@ -677,10 +681,13 @@ fi
 	//   name match (never prefix-matching the "-shell" session).
 	const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
 	const watchCmd = `fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}`;
+	// TMUX= : same nesting note as the Terminal 2 hop above — fresh lives
+	// inside the wrapper's shield tmux, the inner session on the default
+	// socket must not see its TMUX var.
 	editor.sendTerminalInput(
 		shell.terminalId,
 		tmuxBin
-			? `exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession)} ';' send-keys -t ${JSON.stringify("=" + tmuxSession + ":")} '${watchCmd}' Enter\n`
+			? `TMUX= exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession)} ';' send-keys -t ${JSON.stringify("=" + tmuxSession + ":")} '${watchCmd}' Enter\n`
 			: `${watchCmd}\n`,
 	);
 	let seen = 0;
