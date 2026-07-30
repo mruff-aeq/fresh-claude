@@ -333,41 +333,11 @@ fi
 		focus: false,
 	});
 
-	// (The shell is hopped into tmux at the watcher-launch step below — one
-	// typed line does both, see the comment there.)
-
 	// Second terminal as a TAB next to Terminal 1: the watcher occupies
 	// Terminal 1's foreground, so this one is for actual shell work. The
 	// open_terminal action (what the tab bar "+" runs) creates a terminal
-	// tab directly in the FOCUSED split — no throwaway split needed. It
-	// returns no terminalId, so catch the new terminal's first
-	// terminal_output event (the id not already known) to type the tmux
-	// line. Its own persistent per-workspace tmux session — same
-	// leak-eating rationale as below, but a plain `exec` typed line
-	// suffices: nothing else types into this pane, so there is no
-	// stale-watcher or multi-line race to manage. sendTerminalInput just
-	// buffers in the pty, so racing zsh's startup is fine.
-	// FRESH_TMUX_SESSION comes from the wrapper (workspace-path-derived):
-	// fixed names made concurrent fresh-claude instances attach to each
-	// other's sessions via -A (mirrored terminals).
-	const tmuxSession = editor.getEnv("FRESH_TMUX_SESSION") || "fresh";
+	// tab directly in the FOCUSED split — no throwaway split needed.
 	{
-		const knownTerms = new Set([claudeTerm.terminalId, shell.terminalId]);
-		let term2Seen = false;
-		editor.on("terminal_output", (args) => {
-			if (term2Seen || knownTerms.has(args.terminal_id)) return;
-			term2Seen = true;
-			const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
-			// TMUX= : fresh itself now runs inside the wrapper's shield tmux
-			// (see bin/fresh-claude), so this pty inherits TMUX and a bare
-			// tmux would refuse to nest. The inner session targets the
-			// DEFAULT socket, distinct from the shield's -L socket.
-			if (tmuxBin)
-				editor.sendTerminalInput(
-					args.terminal_id,
-					`TMUX= exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession + "-shell")}\n`,
-				);
-		});
 		if (shell.splitId !== null) editor.focusSplit(shell.splitId);
 		const bufsBefore = new Set(editor.listBuffers().map((b) => b.id));
 		editor.executeAction("open_terminal");
@@ -662,44 +632,13 @@ fi
 	const queue = `/tmp/fresh-open-queue-${Date.now()}`;
 	editor.writeFile(queue, "");
 	// Foreground, output visible — the shell doubles as the watcher log;
-	// open another terminal (+ on the tab bar) for shell work.
-	//
-	// With tmux available, ONE typed line hops the shell into tmux AND
-	// launches the watcher inside it:
-	//   exec tmux new-session -A -s <sess> ';' send-keys -t '=<sess>:' '<watch>' Enter
-	// Why this shape (each part is load-bearing):
-	// - tmux at all: raw-mode TUI that parses all pty input, so the mouse
-	//   escape sequences fresh leaks into the focused pane (fresh 0.4.x
-	//   parser desync on split sequences) are consumed, not echoed as ^[[M
-	//   garbage at the prompt.
-	// - TYPED, not spawned via createTerminal's command: a directly-spawned
-	//   tmux client dies if any stray byte reaches it before it finishes
-	//   attaching; typed input just buffers in the pty until zsh runs it.
-	// - ONE line, chained with tmux's ';': a second typed line could be
-	//   slurped into zsh's line editor together with the first and lost at
-	//   the exec. send-keys is executed by tmux after new-session attaches,
-	//   and tmux buffers it into the pane's pty, so the watcher command
-	//   waits for the inner shell's prompt instead of racing it.
-	// - exec: quitting tmux closes the pane, no leftover outer zsh.
-	// - -A -s <sess>: one persistent session PER WORKSPACE (name from the
-	//   wrapper via FRESH_TMUX_SESSION) — the shell (and anything running in
-	//   it) survives fresh restarts in the same dir, while concurrent
-	//   instances in other dirs get their own sessions instead of attaching
-	//   to this one. The wrapper pre-clears a reattached session's stale
-	//   watcher server-side (send-keys C-c), so the prompt is free to take
-	//   the new watcher command. `=` in the send-keys target forces exact
-	//   name match (never prefix-matching the "-shell" session).
-	const tmuxBin = editor.getEnv("FRESH_TMUX_BIN");
+	// open another terminal (+ on the tab bar) for shell work. TYPED, not
+	// spawned via createTerminal's command: typed input just buffers in the
+	// pty until zsh runs it, so racing the shell's startup is fine. The
+	// watcher is a plain PTY child — it dies with fresh, so there is no
+	// stale-watcher cleanup on relaunch.
 	const watchCmd = `fresh-watch-open ${JSON.stringify(editor.getCwd())} ${JSON.stringify(queue)}`;
-	// TMUX= : same nesting note as the Terminal 2 hop above — fresh lives
-	// inside the wrapper's shield tmux, the inner session on the default
-	// socket must not see its TMUX var.
-	editor.sendTerminalInput(
-		shell.terminalId,
-		tmuxBin
-			? `TMUX= exec ${JSON.stringify(tmuxBin)} new-session -A -s ${JSON.stringify(tmuxSession)} ';' send-keys -t ${JSON.stringify("=" + tmuxSession + ":")} '${watchCmd}' Enter\n`
-			: `${watchCmd}\n`,
-	);
+	editor.sendTerminalInput(shell.terminalId, `${watchCmd}\n`);
 	let seen = 0;
 	// Closing the last file tab makes fresh collapse the editor split (the
 	// shell split expands into its area) — openFileInSplit against the dead
