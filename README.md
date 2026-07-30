@@ -17,7 +17,7 @@ Claude Code IDE layout for [fresh](https://getfresh.dev) terminal editor. One co
 ## How work
 
 - Claude (or anything) change file → file appear in **Artifacts** panel. Grouped by dir, newest on top. `(new)` = created, `(+12)` = 12 lines changed.
-- Click entry → file open in editor, changed lines **green**, jump to first change.
+- Click entry → file open in editor, changed lines **green**, jump to first change. Scrollbar show green/red marks where changes live.
 - Delete file → entry gone, tab gone. Revert file → entry gone. No clutter.
 - No tab spam — nothing opens until you click.
 - **Tree** panel: click folder = fold/unfold, click file = open. Test-runner temp churn filtered out.
