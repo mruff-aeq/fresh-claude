@@ -443,6 +443,13 @@ fi
 	// look: dim red BACKGROUND (DIFF_BG's red twin), light red accents.
 	const DEL_NS = "fresh-claude-del";
 
+	// Scrollbar diff markers (0.4.6 setScrollbarMarkers): adds as green range
+	// marks, deletions as red point marks. Bright twins of the overlay
+	// backgrounds — a 1-cell track mark needs accent-strength color. The set
+	// is replaced atomically per namespace, so each repaint just resends all.
+	const SB_NS = "fresh-claude-diff-sb";
+	const SB_ADD: [number, number, number] = [110, 205, 130];
+
 	async function highlightDiff(
 		path: string,
 		bufferId: number,
@@ -455,17 +462,34 @@ fi
 		if (diff === null) return;
 		editor.clearNamespace(bufferId, DIFF_NS);
 		const content = editor.readFile(path);
-		if (content === null) return;
+		if (content === null) {
+			editor.clearScrollbarMarkers(bufferId, SB_NS);
+			return;
+		}
 		// Both key spellings — the API docs and OverlayOptions disagree.
 		const style = { bg: DIFF_BG, extendToLineEnd: true, extend_to_line_end: true };
 		const total = editor.utf8ByteLength(content);
 		editor.clearVirtualLinesInRange(bufferId, DEL_NS, 0, total + 1);
 		if (diff === "all") {
 			if (total > 0) editor.addOverlay(bufferId, DIFF_NS, 0, total, style);
+			editor.setScrollbarMarkers(
+				bufferId,
+				SB_NS,
+				total > 0 ? [{ position: 0, end: total, color: SB_ADD }] : [],
+			);
 			return;
 		}
 		const { adds, dels } = diff;
-		if (adds.length === 0 && dels.length === 0) return;
+		if (adds.length === 0 && dels.length === 0) {
+			editor.setScrollbarMarkers(bufferId, SB_NS, []);
+			return;
+		}
+		const sbMarkers: Array<{
+			position: number;
+			end?: number;
+			color: [number, number, number];
+			priority?: number;
+		}> = [];
 		const lines = content.split("\n");
 		// starts[i] = byte offset of line i (0-indexed); overlays take bytes.
 		const starts: number[] = [0];
@@ -476,7 +500,10 @@ fi
 			// End of line b: start of line b+1 minus its "\n" (clamped for a
 			// missing trailing newline on the last line).
 			const e = Math.min(starts[Math.min(b, lines.length)] - 1, total);
-			if (e > s) editor.addOverlay(bufferId, DIFF_NS, s, e, style);
+			if (e > s) {
+				editor.addOverlay(bufferId, DIFF_NS, s, e, style);
+				sbMarkers.push({ position: s, end: e, color: SB_ADD });
+			}
 		}
 		// One red phantom line PER deleted line, showing its old content —
 		// capped per block so a huge deletion can't wallpaper the buffer.
@@ -499,7 +526,11 @@ fi
 			const anchor = above ? starts[d.line] : starts[Math.max(0, lines.length - 1)];
 			for (const text of shown)
 				editor.addVirtualLine(bufferId, anchor, text, opts, above, DEL_NS, 0);
+			// Point mark on the track; higher priority so a deletion dot
+			// isn't swallowed by an adjacent green range sharing its cell.
+			sbMarkers.push({ position: anchor, color: DEL_ACCENT, priority: 1 });
 		}
+		editor.setScrollbarMarkers(bufferId, SB_NS, sbMarkers);
 	}
 
 	// Serialize refreshes so two rapid events for one file can't interleave
