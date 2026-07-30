@@ -621,38 +621,36 @@ fi
 		if (p) scheduleHighlight(p);
 	});
 
-	// fresh auto-reloads a buffer whose file changed on disk, and the reload
-	// WIPES all plugin overlays — usually right after the watcher-driven
-	// highlight pass has painted them (the reload lands last and wins). The
-	// reload surfaces as lines_changed with the buffer left unmodified, so:
-	// re-highlight on lines_changed, debounced per buffer, skipping buffers
-	// with real unsaved edits (typing also fires this event, but a diff of
-	// DISK content against an edited buffer would paint at stale offsets).
-	//
-	// lines_changed is a RENDER-side event: it also fires when scrolling
-	// merely brings new lines into view. Gate on `epoch` — the buffer
-	// VERSION, which bumps only on real content changes (edits, reload) —
-	// or plain scrolling re-runs the whole clear/re-add highlight pass
-	// right as each scroll settles: visible end-of-scroll jitter plus a
-	// git-diff spawn per scroll.
-	const rehlPending = new Set<number>();
-	const rehlEpoch = new Map<number, number>();
-	editor.on("lines_changed", (args) => {
-		const bid = args.buffer_id;
-		if (typeof bid !== "number") return;
-		const epoch = typeof args.epoch === "number" ? args.epoch : -1;
-		if (rehlEpoch.get(bid) === epoch) return;
-		rehlEpoch.set(bid, epoch);
-		if (rehlPending.has(bid)) return;
-		const p = editor.getBufferPath(bid);
-		if (!p || !p.startsWith(CWD + "/")) return;
-		rehlPending.add(bid);
+	// fresh auto-reloads a buffer whose file changed on disk (its own watcher,
+	// ~1s slower than ours), and the reload WIPES the overlays the
+	// watcher-driven highlightDiff just painted. Repaint AFTER the reload has
+	// landed: two delayed passes per disk event, pure timers hanging off the
+	// fswatch queue. Render-side events (lines_changed) are deliberately NOT
+	// used for this — they also fire on plain scrolling (new lines into
+	// view), and any scroll-triggered clear/re-add pass is visible jitter:
+	// green overlays and red phantom lines flap in and out, so the viewport
+	// rapidly alternates between two layouts. Nothing in this file is allowed
+	// to do work from a scroll; highlight latency is fine, churn is not.
+	const repaintPending = new Set<string>();
+	function repaintAfterAutoReload(path: string) {
+		if (repaintPending.has(path)) return;
+		repaintPending.add(path);
 		(async () => {
-			await editor.delay(300);
-			rehlPending.delete(bid);
-			if (!editor.isBufferModified(bid)) scheduleHighlight(p);
+			try {
+				// 2s catches the common case (reload trails the watcher by
+				// ~1s); the second pass at +3s covers a slow reload, and is a
+				// no-op repaint of identical overlays when the first stuck.
+				for (const ms of [2000, 3000]) {
+					await editor.delay(ms);
+					const bid = editor.findBufferByPath(path);
+					if (!bid) return;
+					if (!editor.isBufferModified(bid)) scheduleHighlight(path);
+				}
+			} finally {
+				repaintPending.delete(path);
+			}
 		})();
-	});
+	}
 
 	// ── Watcher → Artifacts broadcast ────────────────────────────────────
 	// fswatch (in the bottom shell — fresh's own recursive watchPath dies
@@ -807,6 +805,7 @@ fi
 					if (!editor.isBufferModified(bufId))
 						await editor.refreshBufferFromDisk(bufId);
 					await highlightDiff(path, bufId, diff);
+					repaintAfterAutoReload(path);
 				}
 			})
 			.catch((e) => editor.debug(`init.ts: artifact update failed: ${e}`));
