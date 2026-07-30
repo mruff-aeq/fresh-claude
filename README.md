@@ -30,7 +30,7 @@ Claude Code IDE layout for [fresh](https://getfresh.dev) terminal editor. One co
 - python3, git, rsync
 - [Claude Code](https://claude.com/claude-code)
 - Nerd Font in terminal (for folder chevrons)
-- macOS or Linux
+- macOS, Linux, or WSL2
 
 ## Install
 
