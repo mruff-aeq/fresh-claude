@@ -183,7 +183,9 @@ fi
 			for (const { path, a } of items) {
 				const tag =
 					a.status === "new"
-						? "new"
+						? a.added
+							? `new +${a.added}`
+							: "new"
 						: a.status === "unknown"
 							? "changed"
 							: [a.added ? `+${a.added}` : "", a.deleted ? `-${a.deleted}` : ""]
@@ -772,7 +774,17 @@ fi
 				}
 				const status =
 					diff === "all" ? "new" : diff === null ? "unknown" : "modified";
-				const added = diff !== null && diff !== "all" ? sumAdded(diff.adds) : 0;
+				// A new file's "added" is its whole line count, so the panel can
+				// show "(new +200)" instead of a bare "(new)". Trailing-newline
+				// split yields a phantom last "" element — don't count it.
+				let added = 0;
+				if (diff === "all") {
+					const c = editor.readFile(path);
+					if (c !== null && c !== "")
+						added = c.split("\n").length - (c.endsWith("\n") ? 1 : 0);
+				} else if (diff !== null) {
+					added = sumAdded(diff.adds);
+				}
 				const deleted =
 					diff !== null && diff !== "all"
 						? diff.dels.reduce((n, d) => n + d.count, 0)
