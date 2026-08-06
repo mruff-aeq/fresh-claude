@@ -470,8 +470,28 @@ fi
 		const style = { bg: DIFF_BG, extendToLineEnd: true, extend_to_line_end: true };
 		const total = editor.utf8ByteLength(content);
 		editor.clearVirtualLinesInRange(bufferId, DEL_NS, 0, total + 1);
+		const lines = content.split("\n");
+		// starts[i] = byte offset of line i (0-indexed); overlays take bytes.
+		const starts: number[] = [0];
+		for (const line of lines)
+			starts.push(starts[starts.length - 1] + editor.utf8ByteLength(line) + 1);
+		// ONE OVERLAY PER LINE, never one per range: fresh renders a multi-line
+		// overlay only near its endpoints (roughly a screenful at each end), so
+		// the middle of a big added block scrolls by with no green. Verified
+		// headless: a 200-line overlay shows on the first/last ~37 rows only;
+		// per-line overlays render at every scroll position. An empty line gets
+		// its newline byte — that paints the row, and provably does not bleed
+		// into the next line.
+		const paintLines = (a: number, b: number) => {
+			for (let ln = a; ln <= Math.min(b, lines.length); ln++) {
+				const s = starts[ln - 1];
+				const len = starts[ln] - s - 1;
+				const e = len > 0 ? s + len : Math.min(s + 1, total);
+				if (e > s) editor.addOverlay(bufferId, DIFF_NS, s, e, style);
+			}
+		};
 		if (diff === "all") {
-			if (total > 0) editor.addOverlay(bufferId, DIFF_NS, 0, total, style);
+			if (total > 0) paintLines(1, lines.length);
 			editor.setScrollbarMarkers(
 				bufferId,
 				SB_NS,
@@ -490,20 +510,15 @@ fi
 			color: [number, number, number];
 			priority?: number;
 		}> = [];
-		const lines = content.split("\n");
-		// starts[i] = byte offset of line i (0-indexed); overlays take bytes.
-		const starts: number[] = [0];
-		for (const line of lines)
-			starts.push(starts[starts.length - 1] + editor.utf8ByteLength(line) + 1);
 		for (const [a, b] of adds) {
+			paintLines(a, b);
 			const s = starts[Math.min(a - 1, lines.length - 1)];
 			// End of line b: start of line b+1 minus its "\n" (clamped for a
-			// missing trailing newline on the last line).
+			// missing trailing newline on the last line). A range that is one
+			// empty line collapses to s — a point marker still marks the track.
 			const e = Math.min(starts[Math.min(b, lines.length)] - 1, total);
-			if (e > s) {
-				editor.addOverlay(bufferId, DIFF_NS, s, e, style);
-				sbMarkers.push({ position: s, end: e, color: SB_ADD });
-			}
+			if (e > s) sbMarkers.push({ position: s, end: e, color: SB_ADD });
+			else sbMarkers.push({ position: s, color: SB_ADD });
 		}
 		// One red phantom line PER deleted line, showing its old content —
 		// capped per block so a huge deletion can't wallpaper the buffer.
