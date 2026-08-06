@@ -953,6 +953,84 @@ fi
 		scheduleOpen(path);
 	});
 
+	// ── Nested-gitignore filter ──────────────────────────────────────────
+	// A workspace like ~/Desktop/Work holds many independent git repos, each
+	// with its own .gitignore; a test run in one of them sprays ignored churn
+	// (coverage output, __pycache__ leftovers, build artifacts) that the
+	// static EXCLUDE_DIRS list can't anticipate — and it all lands in the
+	// Artifacts panel. Before a queued path becomes an artifact, ask the repo
+	// that CONTAINS it (nearest ancestor dir with a .git, found by walking up
+	// — no startup scan, so repos cloned mid-session work too) whether the
+	// path is ignored: one batched `git check-ignore` per repo per queue
+	// burst, verdicts cached per path (test runs rewrite the same paths over
+	// and over). Paths outside any repo, and any git failure, fail OPEN — a
+	// wrongly listed artifact beats a silently missing one.
+	const hasGitCache = new Map<string, boolean>();
+	function dirHasGit(dir: string): boolean {
+		let v = hasGitCache.get(dir);
+		if (v === undefined) {
+			try {
+				v = editor.readDir(dir).some((en) => en.name === ".git");
+			} catch {
+				v = false;
+			}
+			hasGitCache.set(dir, v);
+		}
+		return v;
+	}
+	// Nearest git repo root containing path, bounded by the workspace root.
+	function gitRootOf(path: string): string | null {
+		let dir = path.slice(0, path.lastIndexOf("/"));
+		while (dir === CWD || dir.startsWith(CWD + "/")) {
+			if (dirHasGit(dir)) return dir;
+			if (dir === CWD) break;
+			dir = dir.slice(0, dir.lastIndexOf("/"));
+		}
+		return null;
+	}
+	const ignoredCache = new Map<string, boolean>();
+	async function filterIgnored(paths: string[]): Promise<string[]> {
+		const toAsk = new Map<string, string[]>(); // repo root → uncached paths
+		for (const p of paths) {
+			if (ignoredCache.has(p)) continue;
+			const root = gitRootOf(p);
+			if (root === null) {
+				ignoredCache.set(p, false);
+				continue;
+			}
+			let list = toAsk.get(root);
+			if (list === undefined) toAsk.set(root, (list = []));
+			list.push(p);
+		}
+		for (const [root, ps] of toAsk) {
+			// Chunked: a checkout burst can queue thousands of paths, and one
+			// argv must stay under the exec limit.
+			for (let i = 0; i < ps.length; i += 500) {
+				const chunk = ps.slice(i, i + 500);
+				const ignored = new Set<string>();
+				try {
+					// check-ignore echoes the ignored subset on stdout.
+					// Exit 0 = some ignored, 1 = none, >1 = error (fail open).
+					const res = await editor.spawnProcess(
+						"git",
+						["-C", root, "check-ignore", "--", ...chunk],
+						CWD,
+					);
+					if (res.exit_code === 0 || res.exit_code === 1)
+						for (const ln of res.stdout.split("\n"))
+							if (ln !== "") ignored.add(ln);
+				} catch (e) {
+					editor.debug(`init.ts: check-ignore failed for ${root}: ${e}`);
+				}
+				for (const p of chunk) ignoredCache.set(p, ignored.has(p));
+			}
+		}
+		return paths.filter((p) => ignoredCache.get(p) !== true);
+	}
+	// Serialize queue batches so a slow check-ignore can't reorder artifact
+	// updates across bursts.
+	let ignoreChain: Promise<void> = Promise.resolve();
+
 	try {
 		const queueHandle = await editor.watchPath(queue, false);
 		editor.on("path_changed", (args) => {
@@ -960,7 +1038,10 @@ fi
 			const text = editor.readFile(queue);
 			if (text === null) return;
 			const lines = text.split("\n").filter(Boolean);
-			for (const p of lines.slice(seen)) {
+			const batch = lines.slice(seen);
+			seen = lines.length;
+			const live: string[] = [];
+			for (const p of batch) {
 				if (!editor.fileExists(p)) {
 					// Deleted or renamed away — close the stale tab so temp
 					// files don't linger after Claude cleans them up, and
@@ -971,9 +1052,23 @@ fi
 					if (p === lastPreview) lastPreview = "";
 					continue;
 				}
-				scheduleArtifact(p);
+				live.push(p);
 			}
-			seen = lines.length;
+			if (live.length === 0) return;
+			// An edited .gitignore changes verdicts — drop the cache and let
+			// the next burst re-ask git.
+			if (live.some((p) => p.endsWith("/.gitignore"))) ignoredCache.clear();
+			ignoreChain = ignoreChain
+				.then(async () => {
+					const kept = new Set(await filterIgnored(live));
+					for (const p of live) {
+						if (kept.has(p)) scheduleArtifact(p);
+						// Newly ignored (e.g. the .gitignore just gained a
+						// rule): retire any entry it earned earlier.
+						else dropArtifact(p);
+					}
+				})
+				.catch((e) => editor.debug(`init.ts: gitignore filter failed: ${e}`));
 		});
 	} catch (e) {
 		editor.debug(`init.ts: open-queue watch failed: ${e}`);
