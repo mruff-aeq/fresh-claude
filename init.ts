@@ -978,15 +978,19 @@ fi
 		}
 		return v;
 	}
-	// Nearest git repo root containing path, bounded by the workspace root.
+	// Nearest git repo root containing path. Walks all the way up to "/",
+	// NOT just to the workspace root: a workspace opened INSIDE a repo
+	// (e.g. lear/legal-api, whose .git and .gitignore live one level up in
+	// lear/) must still get that repo's verdicts — bounding the walk at CWD
+	// silently disabled the filter there and every test-run leftover showed
+	// up as "(new)".
 	function gitRootOf(path: string): string | null {
 		let dir = path.slice(0, path.lastIndexOf("/"));
-		while (dir === CWD || dir.startsWith(CWD + "/")) {
+		while (dir !== "") {
 			if (dirHasGit(dir)) return dir;
-			if (dir === CWD) break;
 			dir = dir.slice(0, dir.lastIndexOf("/"));
 		}
-		return null;
+		return dirHasGit("/") ? "/" : null;
 	}
 	const ignoredCache = new Map<string, boolean>();
 	async function filterIgnored(paths: string[]): Promise<string[]> {
@@ -1080,6 +1084,9 @@ fi
 	// coalesce or drop events — and the watcher may be down mid-relaunch —
 	// leaving tabs whose files no longer exist. Safety net: stat every open
 	// file tab in the workspace every few seconds and close the gone ones.
+	// Artifact entries get the same sweep — a tool's temp file (atomic-write
+	// `.tmp.*`, `.!pid!name`, mkstemp names) that was created and deleted
+	// within one coalesced fswatch event can otherwise linger as "(new)".
 	(async () => {
 		for (;;) {
 			await editor.delay(3000);
@@ -1090,6 +1097,11 @@ fi
 				closeGoneBuffer(b.path);
 				dropArtifact(b.path);
 				if (b.path === lastPreview) lastPreview = "";
+			}
+			for (const p of Array.from(artifacts.keys())) {
+				if (editor.fileExists(p)) continue;
+				dropArtifact(p);
+				if (p === lastPreview) lastPreview = "";
 			}
 		}
 	})();
