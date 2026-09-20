@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 0 1600 820" font-family="Menlo, 'DejaVu Sans Mono', Consolas, monospace" font-size="17">
+  <style>
+    .bg{fill:#2e3440}.panel{fill:#3b4252;stroke:#4c566a;stroke-width:1.5}
+    .t{fill:#d8dee9}.dim{fill:#6b768c}.dir{fill:#81a1c1}.chev{fill:#ebcb8b}.badge{fill:#6ecd82}
+    .h{fill:#eceff4;font-size:22px;font-weight:bold}.sub{fill:#88c0d0;font-size:15px}
+    .bad{fill:#bf616a}.good{fill:#a3be8c}.note{fill:#e5e9f0;font-size:15px}.code{fill:#ebcb8b;font-size:14px}
+    .cut{stroke:#bf616a;stroke-width:2;stroke-dasharray:5 4}.key{fill:#d08770;font-weight:bold}
+  </style>
+  <rect class="bg" width="1600" height="820"/>
+  <text x="40" y="46" class="h">File Explorer: long names today vs proposed <tspan class="key">file_explorer.overflow</tspan></text>
+  <text x="40" y="72" class="sub">fresh 0.5.1 · sidebar width 28 · headless capture · names are real files from the repro</text>
+
+  <!-- ===== Column A: explorer today ===== -->
+  <text x="40" y="118" class="h" font-size="19">TODAY · File Explorer</text>
+  <text x="40" y="140" class="sub">hard cut at the panel edge</text>
+  <rect class="panel" x="40" y="156" width="400" height="212" rx="4"/>
+  <g xml:space="preserve" class="t">
+    <text x="56" y="186"><tspan class="chev">▼ </tspan><tspan class="dir">fresh-claude</tspan>                <tspan class="badge">●</tspan></text>
+    <text x="56" y="214">  <tspan class="chev">&gt; </tspan><tspan class="dir">bin</tspan></text>
+    <text x="56" y="242">    demo_screenshot.pn</text>
+    <text x="56" y="270">    a_very_long_file_name</text>
+    <text x="56" y="298">    init.ts                 <tspan class="badge">●</tspan></text>
+    <text x="56" y="326">    README.md               <tspan class="badge">●</tspan></text>
+  </g>
+  <line class="cut" x1="272" y1="226" x2="272" y2="282"/>
+  <text x="280" y="248" class="bad">◀ "g" gone</text>
+  <text x="280" y="276" class="bad">◀ 30 chars gone</text>
+  <text x="40" y="394" class="note">• no ellipsis, no hover tooltip, no wrap option</text>
+  <text x="40" y="418" class="note">• only knob is <tspan class="code">file_explorer.width</tspan> (default "30%")</text>
+  <text x="40" y="442" class="note">• deep trees eat width with indent, so widening</text>
+  <text x="40" y="464" class="note">  never fully fixes it</text>
+
+  <!-- ===== Column B: widget today ===== -->
+  <text x="560" y="118" class="h" font-size="19">TODAY · sidebar tree widget</text>
+  <text x="560" y="140" class="sub">same sidebar, one section lower</text>
+  <rect class="panel" x="560" y="156" width="400" height="100" rx="4"/>
+  <g xml:space="preserve" class="t">
+    <text x="576" y="186"><tspan class="chev">▼ </tspan><tspan class="dir">./  (1)</tspan></text>
+    <text x="576" y="214">   <tspan class="badge">●</tspan> a_very_long_file_nam<tspan class="good">…</tspan></text>
+  </g>
+  <text x="560" y="290" class="note">• host already draws <tspan class="good">…</tspan> for widget rows</text>
+  <text x="560" y="314" class="note">• explorer rows next to it do not</text>
+  <text x="560" y="338" class="note">• two overflow rules in one column</text>
+
+  <text x="560" y="394" class="h" font-size="19">BEFORE 0.5.0 · plugin tree</text>
+  <text x="560" y="416" class="sub">virtual buffer with lineWrap — what users had</text>
+  <rect class="panel" x="560" y="432" width="400" height="100" rx="4"/>
+  <g xml:space="preserve" class="t">
+    <text x="576" y="462">    a_very_long_file_name</text>
+    <text x="576" y="490">      _that_will_not_fit.txt</text>
+  </g>
+  <text x="560" y="560" class="note">Replaced by the native explorer (badges, menus,</text>
+  <text x="560" y="582" class="note">keyboard nav) — wrapping was the one loss.</text>
+
+  <!-- ===== Column C: proposed ===== -->
+  <text x="1090" y="118" class="h" font-size="19">PROPOSED · <tspan class="key">file_explorer.overflow</tspan></text>
+  <text x="1090" y="140" class="sub">enum, opt-in, default = today</text>
+
+  <text x="1090" y="176" class="note"><tspan class="key">"truncate"</tspan>  (default — unchanged)</text>
+  <rect class="panel" x="1090" y="186" width="400" height="40" rx="4"/>
+  <g xml:space="preserve" class="t"><text x="1106" y="212">    demo_screenshot.pn</text></g>
+
+  <text x="1090" y="256" class="note"><tspan class="key">"ellipsis"</tspan>  (cheap middle ground)</text>
+  <rect class="panel" x="1090" y="266" width="400" height="40" rx="4"/>
+  <g xml:space="preserve" class="t"><text x="1106" y="292">    demo_screenshot.p<tspan class="good">…</tspan></text></g>
+
+  <text x="1090" y="336" class="note"><tspan class="key">"wrap"</tspan>  (row grows, indent kept)</text>
+  <rect class="panel" x="1090" y="346" width="400" height="68" rx="4"/>
+  <g xml:space="preserve" class="t">
+    <text x="1106" y="372">    demo_screenshot.</text>
+    <text x="1106" y="400">      png                    <tspan class="badge">●</tspan></text>
+  </g>
+
+  <text x="1090" y="450" class="sub">set in any config layer:</text>
+  <rect class="panel" x="1090" y="460" width="480" height="118" rx="4"/>
+  <g xml:space="preserve" class="code">
+    <text x="1106" y="486"><tspan class="dim">// .fresh/config.json (project)</tspan></text>
+    <text x="1106" y="510">{ "file_explorer": { "overflow": "wrap" } }</text>
+    <text x="1106" y="538"><tspan class="dim">// init.ts (runtime, must re-layout)</tspan></text>
+    <text x="1106" y="562">editor.setSetting("file_explorer.overflow", "wrap")</text>
+  </g>
+
+  <!-- footer -->
+  <line x1="40" y1="630" x2="1560" y2="630" stroke="#4c566a"/>
+  <text x="40" y="664" class="note"><tspan class="good">✓</tspan> default stays "truncate": row height, keyboard nav, scroll offsets, scrollbar (#3071), hit-testing untouched unless opted in</text>
+  <text x="40" y="692" class="note"><tspan class="good">✓</tspan> "ellipsis" alone already closes the explorer-vs-widget gap</text>
+  <text x="40" y="720" class="note"><tspan class="good">✓</tspan> setting applies live: today setSetting("file_explorer.width") updates the value but never re-layouts</text>
+  <text x="40" y="748" class="note"><tspan class="good">✓</tspan> scriptable: fresh-claude's init.ts would opt in for its profile only; plain fresh unaffected</text>
+  <text x="40" y="796" class="dim">headless repro harness: sinelaw/fresh#3338</text>
+</svg>
