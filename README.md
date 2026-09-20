@@ -24,6 +24,7 @@ Left column = fresh's own sidebar: built-in **File Explorer** on top, **Artifact
 - No tab spam — nothing opens until you click.
 - Changed files also get green `●` badge in File Explorer (folders inherit). Open from explorer → same green overlays. Test-runner temp churn filtered out.
 - Green baseline = snapshot when fresh-claude start. Works in any dir, git not needed.
+- `git checkout` / `pull` / `stash` / `reset` mid-session → rewritten files NOT listed; baseline moves with them, so only edits after the switch show. Needs the repo's reflog (plain dirs unaffected).
 
 ## Need
 

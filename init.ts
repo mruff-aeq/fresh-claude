@@ -939,6 +939,116 @@ fi
 		}
 		return paths.filter((p) => ignoredCache.get(p) !== true);
 	}
+	// ── Git-rewrite re-baseline ──────────────────────────────────────────
+	// A branch switch, pull, stash or reset rewrites tracked files wholesale,
+	// and every one lands in the queue looking like an edit: the baseline is
+	// a launch-time mirror, so a checkout five minutes into a session listed
+	// the whole branch delta as artifacts ("(+220)" test files nobody
+	// touched) and the real edits drowned. fswatch can't say WHO wrote a
+	// file, but git can: right after HEAD moves (reflog entry within
+	// REBASE_WINDOW seconds — and not a plain commit, which touches no
+	// working-tree file, so a clean path in a commit's wake is an agent edit
+	// committed inside the debounce, not a git rewrite), any queued path that
+	// is CLEAN vs HEAD was written by git. Those get their mirror copy
+	// replaced with the post-checkout content (removed where git deleted
+	// them), so later edits diff against the new branch and the now-empty
+	// diff retires any entry. Dirty paths are left alone: still "changed since
+	// launch", and the agent may well be why. Rewrites the reflog does NOT
+	// record (`git checkout -- file`, `git restore`) are deliberately not
+	// covered — a file dirty at launch and reverted mid-session is exactly the
+	// trampling the panel should show.
+	const REBASE_WINDOW = 60; // seconds
+	// Pairs of <src> <mirror-dst>: copy (size-capped like the launch rsync)
+	// or, when src is gone / too big, drop the stale mirror copy.
+	const REBASE_SCRIPT = `
+while [ $# -ge 2 ]; do
+  src=$1; dst=$2; shift 2
+  if [ -f "$src" ] && [ "$(wc -c < "$src")" -le 1048576 ]; then
+    mkdir -p "$(dirname "$dst")" && cp -p "$src" "$dst"
+  else
+    rm -f "$dst"
+  fi
+done
+`;
+	// True when the repo's HEAD reflog gained a non-commit entry within the
+	// window. --date=unix puts the ENTRY time in %gd (%ct would be the
+	// commit's own date — ancient for a checkout of an old branch).
+	async function headMovedRecently(root: string): Promise<boolean> {
+		try {
+			const res = await editor.spawnProcess(
+				"git",
+				["-C", root, "reflog", "-1", "--date=unix", "--format=%gd %gs"],
+				CWD,
+			);
+			if (res.exit_code !== 0) return false;
+			const m = /^HEAD@\{(\d+)\} (.*)$/.exec(res.stdout.trim());
+			if (m === null) return false;
+			if (Date.now() / 1000 - Number(m[1]) > REBASE_WINDOW) return false;
+			return !m[2].startsWith("commit");
+		} catch (e) {
+			editor.debug(`init.ts: reflog probe failed for ${root}: ${e}`);
+			return false;
+		}
+	}
+	// Refresh the mirror for every path git just rewrote; returns that subset.
+	// Deleted paths belong here too (checkout removed the file → its mirror
+	// copy goes; agent deleted it → " D" in status → mirror kept, so a later
+	// re-create still diffs against the launch content).
+	async function rebaseGitRewrites(paths: string[]): Promise<Set<string>> {
+		const byRoot = new Map<string, string[]>();
+		for (const p of paths) {
+			if (snapPathOf(p) === null) continue;
+			const root = gitRootOf(p);
+			if (root === null) continue;
+			let list = byRoot.get(root);
+			if (list === undefined) byRoot.set(root, (list = []));
+			list.push(p);
+		}
+		const rebased = new Set<string>();
+		for (const [root, ps] of byRoot) {
+			if (!(await headMovedRecently(root))) continue;
+			for (let i = 0; i < ps.length; i += 500) {
+				const chunk = ps.slice(i, i + 500);
+				// Absolute pathspecs are fine inside the worktree; output is
+				// root-relative "XY path\0". --no-renames keeps it one token
+				// per entry. Untracked ("??") counts as dirty.
+				let dirty: Set<string>;
+				try {
+					const res = await editor.spawnProcess(
+						"git",
+						[
+							"-C", root, "status", "--porcelain", "-z", "--no-renames",
+							"--untracked-files=all", "--", ...chunk,
+						],
+						CWD,
+					);
+					if (res.exit_code !== 0) continue; // fail open: keep listing
+					dirty = new Set(
+						res.stdout.split("\0").filter(Boolean).map((e) => `${root}/${e.slice(3)}`),
+					);
+				} catch (e) {
+					editor.debug(`init.ts: status probe failed for ${root}: ${e}`);
+					continue;
+				}
+				const args: string[] = [];
+				for (const p of chunk) {
+					if (dirty.has(p)) continue;
+					rebased.add(p);
+					args.push(p, snapPathOf(p) as string);
+				}
+				if (args.length === 0) continue;
+				try {
+					const res = await editor.spawnProcess("sh", ["-c", REBASE_SCRIPT, "_", ...args], CWD);
+					if (res.exit_code !== 0)
+						editor.debug(`init.ts: mirror rebase failed for ${root}: ${res.stderr}`);
+				} catch (e) {
+					editor.debug(`init.ts: mirror rebase error for ${root}: ${e}`);
+				}
+				if (rebased.size) editor.debug(`init.ts: re-baselined ${rebased.size} git-rewritten path(s) under ${root}`);
+			}
+		}
+		return rebased;
+	}
 	// Serialize queue batches so a slow check-ignore can't reorder artifact
 	// updates across bursts.
 	let ignoreChain: Promise<void> = Promise.resolve();
@@ -953,6 +1063,7 @@ fi
 			const batch = lines.slice(seen);
 			seen = lines.length;
 			const live: string[] = [];
+			const gone: string[] = [];
 			for (const p of batch) {
 				if (!editor.fileExists(p)) {
 					// Deleted or renamed away — close the stale tab so temp
@@ -961,17 +1072,21 @@ fi
 					closeGoneBuffer(p);
 					dropArtifact(p);
 					if (p === lastPreview) lastPreview = "";
+					gone.push(p);
 					continue;
 				}
 				live.push(p);
 			}
-			if (live.length === 0) return;
+			if (live.length === 0 && gone.length === 0) return;
 			// An edited .gitignore changes verdicts — drop the cache and let
 			// the next burst re-ask git.
 			if (live.some((p) => p.endsWith("/.gitignore"))) ignoredCache.clear();
 			ignoreChain = ignoreChain
 				.then(async () => {
 					const kept = new Set(await filterIgnored(live));
+					// Mirror refresh must land BEFORE the diffs below are
+					// queued: a rebased path then diffs empty and retires.
+					await rebaseGitRewrites([...kept, ...gone]);
 					for (const p of live) {
 						if (kept.has(p)) scheduleArtifact(p);
 						// Newly ignored (e.g. the .gitignore just gained a
