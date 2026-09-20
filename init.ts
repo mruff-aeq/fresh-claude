@@ -2,14 +2,13 @@
 // Only active when launched via the fresh-claude wrapper (FRESH_PROFILE=claude);
 // plain `fresh` is untouched. Installed to ~/.config/fresh/init.ts.
 //
-// Layout: [file tree / Artifacts] | editor (+ shell below) | Claude Code right.
-// The left column is two stacked virtual-buffer panels (the built-in file
-// explorer cannot host a second panel below it, so it stays hidden and the
-// tree is rendered by this script): a lazy file tree on top, and an
-// "Artifacts" panel below listing every file changed since launch. Changed
-// files are BROADCAST to the Artifacts panel instead of auto-opening as tabs;
-// clicking (or pressing Enter on) an entry opens the file in the editor pane
-// with changed lines highlighted green.
+// Layout: [explorer + Artifacts sidebar] | editor (+ shell below) | Claude Code right.
+// The left column is fresh's own sidebar: the built-in file explorer on top
+// and an "Artifacts" section below it (mountSidebarSection, fresh ≥ 0.5.0 —
+// sinelaw/fresh#3045) listing every file changed since launch. Changed files
+// are BROADCAST to the Artifacts section (and badged ● in the explorer)
+// instead of auto-opening as tabs; clicking (or pressing Enter on) an entry
+// opens the file in the editor pane with changed lines highlighted green.
 
 (async () => {
 	if (editor.getEnv("FRESH_PROFILE") !== "claude") return;
@@ -54,35 +53,9 @@ fi
 		editor.debug(`init.ts: workspace snapshot error: ${e}`);
 	}
 
-	// ── Left column: file tree + Artifacts panels ────────────────────────
-	// Same dir skip-list as the snapshot — the tree is for source, not vendored
-	// churn.
-	const EXCLUDE_DIRS = new Set([
-		".git",
-		"node_modules",
-		".venv",
-		"venv",
-		"dist",
-		"build",
-		"coverage",
-		"__pycache__",
-		".pytest_cache",
-		".nuxt",
-		".output",
-		".fresh",
-	]);
-
-	// Pane ratios. COLUMN_RATIO is the tree/Artifacts column's share of the
-	// width (the editor+Claude region gets the rest) — if a fresh update flips
-	// the ratio's meaning, set 0.8. The others match the old layout.
-	const COLUMN_RATIO = 0.2;
-	const ARTIFACTS_RATIO = 0.5; // tree/artifacts split the column 50/50
+	// ── Pane ratios ──────────────────────────────────────────────────────
 	const CLAUDE_RATIO = 0.5;
 	const SHELL_RATIO = 0.75;
-
-	// Tree state: which dirs are expanded (root always is). Dirs are read
-	// lazily — only expanded ones are listed, so big trees stay cheap.
-	const expanded = new Set([CWD]);
 
 	// Artifacts state: path → { status: "new" | "modified" | "unknown",
 	// added: lines }. Insertion order is oldest-first; rendering reverses it,
@@ -97,70 +70,57 @@ fi
 	// Dir rows and file rows get distinct theme-key colors (resolved against
 	// the active theme) in BOTH panels, so the type is readable at a glance:
 	// dirs bold keyword-color, files string-color.
+	// Dir rows and file rows get distinct theme-key colors (resolved against
+	// the active theme), so the type is readable at a glance: dirs bold
+	// keyword-color, files string-color.
 	const DIR_STYLE = { fg: "syntax.keyword", bold: true };
 	const FILE_STYLE = { fg: "syntax.string" };
 	// Deletion accents — shared by the in-file red phantom lines and the
 	// Artifacts "-N" spans. DEL_BG is DIFF_BG's red twin.
 	const DEL_BG: [number, number, number] = [86, 28, 28];
 	const DEL_ACCENT: [number, number, number] = [220, 90, 90];
+	// Explorer badge for changed files — the scrollbar's add-marker green. It
+	// outranks the bundled git badges: "changed since launch" is this
+	// layout's own notion of dirty, and the slot holds one glyph.
+	const ART_DOT: [number, number, number] = [110, 205, 130];
 
-	function treeEntries() {
-		const out: Array<Record<string, unknown>> = [];
-		const walk = (dir: string, depth: number) => {
-			let entries;
-			try {
-				entries = editor.readDir(dir);
-			} catch (e) {
-				editor.debug(`init.ts: readDir(${dir}) failed: ${e}`);
-				return;
-			}
-			entries = entries.filter((en) => !(en.is_dir && EXCLUDE_DIRS.has(en.name)));
-			entries.sort((a, b) =>
-				a.is_dir !== b.is_dir
-					? a.is_dir
-						? -1
-						: 1
-					: a.name.localeCompare(b.name, undefined, {
-							numeric: true,
-							sensitivity: "base",
-						}),
-			);
-			for (const en of entries) {
-				const full = dir + "/" + en.name;
-				const pad = "  ".repeat(depth);
-				if (en.is_dir) {
-					const open = expanded.has(full);
-					// Nerd Font chevrons (as \u escapes so non-NF editors can't
-					// mangle the source): U+F078 chevron-down / U+F054 chevron-right.
-					out.push({
-						text: `${pad}${open ? "\uf078" : "\uf054"} ${en.name}/\n`,
-						properties: { path: full, is_dir: true },
-						style: DIR_STYLE,
-					});
-					if (open) walk(full, depth + 1);
-				} else {
-					out.push({
-						text: `${pad}  ${en.name}\n`,
-						properties: { path: full, is_dir: false },
-						style: FILE_STYLE,
-					});
-				}
-			}
-		};
-		walk(CWD, 0);
-		if (out.length === 0) out.push({ text: "(empty)\n", properties: {} });
-		return out;
+	// ── Artifacts sidebar section ────────────────────────────────────────
+	// One tree widget mounted as a collapsible section UNDER the built-in
+	// file explorer. Rows: one header per directory (workspace-relative, "./"
+	// for the root), newest-touched group first, newest file first within a
+	// group. Group expansion is plugin-owned: the widget's expandedKeys is
+	// initial-only, so it is re-pushed (setExpandedKeys) after every content
+	// update. The host keys panels per plugin, so a constant id suffices.
+	const PANEL_ID = 1;
+	const TREE_KEY = "artifacts";
+	const ART_ROWS = 0; // 0 = share the column with the explorer
+	const ART_NS = "fresh-claude-artifacts"; // explorer decoration namespace
+	const artCollapsed = new Set<string>();
+	// Node index → what the row stands for, parallel to the spec's nodes
+	// (widget_event reports an index over ALL nodes, collapsed ones included).
+	let artRows: Array<{ group: string } | { path: string } | null> = [];
+
+	function artifactTag(a: any): string {
+		return a.status === "new"
+			? a.added
+				? `new +${a.added}`
+				: "new"
+			: a.status === "unknown"
+				? "changed"
+				: [a.added ? `+${a.added}` : "", a.deleted ? `-${a.deleted}` : ""]
+						.filter(Boolean)
+						.join(" ");
 	}
 
-	// Artifacts are grouped under one header row per directory (workspace-
-	// relative, "./" for the root), newest-touched group first, newest file
-	// first within a group. Headers collapse/expand on click or Enter,
-	// tracked separately from the file tree's `expanded` set.
-	const artCollapsed = new Set<string>();
-
-	function artifactEntries() {
-		if (artifacts.size === 0)
-			return [{ text: "(no changes yet)\n", properties: {} }];
+	function artifactSpec() {
+		const nodes: Array<Record<string, unknown>> = [];
+		const keys: string[] = [];
+		artRows = [];
+		if (artifacts.size === 0) {
+			nodes.push({ text: { text: "(no changes yet)" }, depth: 0, hasChildren: false });
+			keys.push("empty");
+			artRows.push(null);
+		}
 		// dir → items newest-first; Map keeps first-seen (= newest) group order.
 		const groups = new Map<string, Array<{ path: string; a: any }>>();
 		for (const [path, a] of [...artifacts.entries()].reverse()) {
@@ -171,41 +131,29 @@ fi
 			if (items === undefined) groups.set(dir, (items = []));
 			items.push({ path, a });
 		}
-		const out: Array<Record<string, unknown>> = [];
 		for (const [dir, items] of groups) {
-			const open = !artCollapsed.has(dir);
-			out.push({
-				text: `${open ? "\uf078" : "\uf054"} ${dir}  (${items.length})\n`,
-				properties: { group: dir },
-				style: DIR_STYLE,
+			nodes.push({
+				text: { text: `${dir}  (${items.length})`, style: DIR_STYLE },
+				depth: 0,
+				hasChildren: true,
 			});
-			if (!open) continue;
+			keys.push(`g:${dir}`);
+			artRows.push({ group: dir });
 			for (const { path, a } of items) {
-				const tag =
-					a.status === "new"
-						? a.added
-							? `new +${a.added}`
-							: "new"
-						: a.status === "unknown"
-							? "changed"
-							: [a.added ? `+${a.added}` : "", a.deleted ? `-${a.deleted}` : ""]
-									.filter(Boolean)
-									.join(" ");
 				const name = dir === "./" ? relPath(path) : relPath(path).slice(dir.length);
-				const head = `  ● ${name}  (`;
-				const entry: Record<string, unknown> = {
-					text: `${head}${tag})\n`,
-					properties: { path, is_dir: false },
+				const head = `● ${name}  (`;
+				const text: Record<string, unknown> = {
+					text: `${head}${artifactTag(a)})`,
 					style: FILE_STYLE,
 				};
 				// Red accent on the "-N" span, matching the in-file deletion
-				// marker. Offsets in BYTES (the InlineOverlay default unit) via
-				// utf8ByteLength — char units miscount the wide ● glyph and
-				// shift the span; bytes are unambiguous.
+				// marker. Offsets in BYTES (the InlineOverlay default unit)
+				// via utf8ByteLength — char units miscount the wide ● glyph.
+				// The host shifts them past the indent/disclosure prefix.
 				if (a.deleted && a.status === "modified") {
 					const addPart = a.added ? `+${a.added} ` : "";
 					const start = editor.utf8ByteLength(`${head}${addPart}`);
-					entry.inlineOverlays = [
+					text.inlineOverlays = [
 						{
 							start,
 							end: start + editor.utf8ByteLength(`-${a.deleted}`),
@@ -213,101 +161,94 @@ fi
 						},
 					];
 				}
-				out.push(entry);
+				nodes.push({ text, depth: 1, hasChildren: false });
+				keys.push(`f:${path}`);
+				artRows.push({ path });
 			}
+		}
+		return {
+			kind: "tree",
+			key: TREE_KEY,
+			nodes,
+			itemKeys: keys,
+			selectedIndex: -1,
+			expandedKeys: expandedGroupKeys(),
+			checkable: false,
+			itemHeight: 1,
+			cardBorders: false,
+			indentCols: 1,
+		};
+	}
+
+	function expandedGroupKeys(): string[] {
+		const out: string[] = [];
+		const seen = new Set<string>();
+		for (const path of artifacts.keys()) {
+			const rel = relPath(path);
+			const cut = rel.lastIndexOf("/");
+			const dir = cut === -1 ? "./" : rel.slice(0, cut + 1);
+			if (seen.has(dir)) continue;
+			seen.add(dir);
+			if (!artCollapsed.has(dir)) out.push(`g:${dir}`);
 		}
 		return out;
 	}
 
-	// Rendered-entry mirrors of what each panel currently displays, indexed by
-	// line — mouse_click reports a buffer_row, and this is how a click row is
-	// resolved back to a path (text properties are only queryable at the
-	// CURSOR, which a click may not have moved yet).
-	let treeRendered: ReturnType<typeof treeEntries> = [];
-	let artifactsRendered: ReturnType<typeof artifactEntries> = [];
-	function renderTreePanel() {
-		treeRendered = treeEntries();
-		if (treeBufId !== null) editor.setVirtualBufferContent(treeBufId, treeRendered);
-		return treeRendered;
+	let artMounted = false;
+	function pushArtExpanded() {
+		if (!artMounted) return;
+		editor.widgetMutate(PANEL_ID, {
+			kind: "setExpandedKeys",
+			widgetKey: TREE_KEY,
+			keys: expandedGroupKeys(),
+		});
 	}
+
+	// Re-publish the section and the explorer badges from `artifacts`.
 	function renderArtifactsPanel() {
-		artifactsRendered = artifactEntries();
-		if (artifactsBufId !== null)
-			editor.setVirtualBufferContent(artifactsBufId, artifactsRendered);
-		return artifactsRendered;
+		try {
+			editor.setFileExplorerDecorations(
+				ART_NS,
+				[...artifacts.keys()].map((path) => ({
+					path,
+					symbol: "●",
+					color: ART_DOT,
+					priority: 100, // above git_explorer's M/A badges
+
+				})),
+			);
+		} catch (e) {
+			editor.debug(`init.ts: explorer decorations failed: ${e}`);
+		}
+		if (!artMounted) return;
+		editor.updateFloatingWidget(PANEL_ID, artifactSpec());
+		pushArtExpanded();
 	}
 
-	// Modes must exist before the buffers that use them. Both panels share one
-	// activate command: Enter toggles a folder or opens a file.
-	// inheritNormalBindings: arrows/PageUp/etc must still navigate the panels.
-	editor.defineMode("fc-tree", [["Return", "fc_activate"]], true, false, true);
-	editor.defineMode("fc-artifacts", [["Return", "fc_activate"]], true, false, true);
-
-	// Build the column off the single startup split. `before: true` places
-	// the new pane LEFT of the editor pane directly.
+	// The startup split is the editor pane; the sidebar is chrome, not a
+	// split, so nothing here changes the split tree.
 	const s0 = editor.listSplits()[0];
 	// `let`: the editor split DIES when its last tab is closed (fresh
 	// collapses an empty split); ensureEditorSplit below rebuilds + reassigns.
 	let editorSplitId: number | undefined = s0?.splitId;
-	let treeSplitId: number | undefined;
-	let treeBufId: number | null = null;
-	let artifactsBufId: number | null = null;
 	try {
-		const tree = await editor.createVirtualBufferInSplit({
-			name: "*Files*",
-			mode: "fc-tree",
-			readOnly: true,
-			entries: (treeRendered = treeEntries()),
-			ratio: COLUMN_RATIO,
-			direction: "vertical",
-			before: true,
-			showLineNumbers: false,
-			editingDisabled: true,
+		// A FOCUSED mount reveals the sidebar column (explorer included) even
+		// when the last session left it hidden — a blurred mount is silent
+		// (Editor::reveal_sidebar). Mount focused, then hand the keyboard
+		// straight back to the editor pane.
+		artMounted = editor.mountSidebarSection(PANEL_ID, artifactSpec(), "Artifacts", ART_ROWS, {
+			closable: false,
+			startBlurred: false,
 		});
-		treeBufId = tree.bufferId;
-		treeSplitId = tree.splitId ?? undefined;
-	} catch (e) {
-		editor.debug(`init.ts: tree panel creation failed; left column disabled: ${e}`);
-	}
-
-	if (treeSplitId !== undefined) {
-		editor.focusSplit(treeSplitId);
-		try {
-			const art = await editor.createVirtualBufferInSplit({
-				name: "*Artifacts*",
-				mode: "fc-artifacts",
-				readOnly: true,
-				entries: (artifactsRendered = artifactEntries()),
-				ratio: ARTIFACTS_RATIO,
-				direction: "horizontal",
-				showLineNumbers: false,
-				editingDisabled: true,
-			});
-			artifactsBufId = art.bufferId;
-		} catch (e) {
-			editor.debug(`init.ts: artifacts panel creation failed: ${e}`);
+		if (!artMounted) editor.debug("init.ts: mountSidebarSection refused; Artifacts section disabled");
+		else {
+			pushArtExpanded();
+			editor.floatingPanelControl(PANEL_ID, "blur", 0);
 		}
+	} catch (e) {
+		editor.debug(`init.ts: Artifacts section creation failed: ${e}`);
 	}
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
-
-
-	// Tree refreshes are debounced — a git checkout can queue hundreds of
-	// watcher events, and one re-render after the burst settles is enough.
-	let treeRefreshPending = false;
-	function scheduleTreeRefresh() {
-		if (treeRefreshPending || treeBufId === null) return;
-		treeRefreshPending = true;
-		(async () => {
-			await editor.delay(500);
-			treeRefreshPending = false;
-			try {
-				renderTreePanel();
-			} catch (e) {
-				editor.debug(`init.ts: tree refresh failed: ${e}`);
-			}
-		})();
-	}
-
 	// Right pane, full height of the editor region: Claude Code spawned
 	// directly in the PTY. Full path via FRESH_CLAUDE_BIN (set by
 	// fresh-claude) — the PTY child skips the login shell, so PATH may not
@@ -792,7 +733,6 @@ fi
 				artifacts.delete(path); // re-insert → newest-first render order
 				artifacts.set(path, { status, added, deleted });
 				renderArtifactsPanel();
-				scheduleTreeRefresh(); // a created file should appear in the tree
 				const bufId = editor.findBufferByPath(path);
 				if (bufId) {
 					// The buffer does NOT auto-reload on external writes — a
@@ -864,100 +804,68 @@ fi
 			.catch((e) => editor.debug(`init.ts: open+highlight failed: ${e}`));
 	}
 
-	// ── Panel activation ─────────────────────────────────────────────────
-	// Enter (bound in both panel modes): toggle a folder, open a file.
-	globalThis.fcActivate = () => {
-		const splitId = editor.getActiveSplitId();
-		const split = editor.listSplits().find((s) => s.splitId === splitId);
-		if (!split) return;
-		const bufId = split.bufferId;
-		if (bufId !== treeBufId && bufId !== artifactsBufId) return;
-		const props = editor.getTextPropertiesAtCursor(bufId);
-		const p = props && props.length > 0 ? props[0] : null;
-		if (!p) return;
-		if (p.group) {
-			const g = String(p.group);
-			if (artCollapsed.has(g)) artCollapsed.delete(g);
-			else artCollapsed.add(g);
-			renderArtifactsPanel();
-			return;
-		}
-		if (!p.path) return;
-		const path = String(p.path);
-		if (p.is_dir) {
-			if (expanded.has(path)) expanded.delete(path);
-			else expanded.add(path);
-			renderTreePanel();
-		} else {
-			scheduleOpen(path);
-		}
-	};
-	// No context arg — the command must stay executable from both panel modes.
-	editor.registerCommand(
-		"fc_activate",
-		"Open file / toggle folder (fresh-claude panels)",
-		"fcActivate",
-	);
-
-	// Click handling: mouse_click reports the clicked buffer_row directly, so
-	// a click on a folder line toggles it (Enter works too) — cursor_moved
-	// can't do this, since arrow-keying through the tree would flap every
-	// folder it passes. Clicked files also open here (dedup via lastPreview:
-	// the same click usually fires cursor_moved as well).
+	// ── Section activation ───────────────────────────────────────────────
+	// The host routes every hit on the Artifacts tree through widget_event:
+	// a disclosure-glyph click is `expand`, Up/Down/click on a row is `select`
+	// (a click's payload is tagged via: "click"), Enter is `activate`. A row
+	// select PREVIEWS the file (keyboard stays in the sidebar, like the
+	// explorer's single-click); Enter opens it and moves focus to the editor.
+	// Nothing here runs from a scroll — see repaintAfterAutoReload.
 	let lastPreview = "";
-	editor.on("mouse_click", (args) => {
-		if (args?.button !== "left") return;
-		const bid = args.buffer_id;
-		const row = args.buffer_row;
-		if (typeof bid !== "number" || typeof row !== "number") return;
-		const rendered =
-			bid === treeBufId ? treeRendered : bid === artifactsBufId ? artifactsRendered : null;
-		if (rendered === null) return;
-		const p = rendered[row]?.properties;
-		if (!p) return;
-		if (p.group) {
-			const g = String(p.group);
-			if (artCollapsed.has(g)) artCollapsed.delete(g);
+	// A collapse/expand is re-PUBLISHED (updateFloatingWidget), not just
+	// pushed as a setExpandedKeys mutation: fresh 0.5.1 tracks the new state
+	// either way (arrow keys skip the hidden rows) but only repaints the
+	// section when its spec is replaced, so a bare mutation leaves the
+	// collapsed children visible until the next content update.
+	function toggleGroup(g: string) {
+		if (artCollapsed.has(g)) artCollapsed.delete(g);
+		else artCollapsed.add(g);
+		renderArtifactsPanel();
+	}
+	editor.on("widget_event", (e) => {
+		if (e.panel_id !== PANEL_ID) return;
+		const payload = (e.payload ?? {}) as {
+			index?: unknown;
+			key?: unknown;
+			expanded?: unknown;
+			via?: unknown;
+		};
+		if (e.event_type === "expand") {
+			if (typeof payload.key !== "string" || !payload.key.startsWith("g:")) return;
+			const g = payload.key.slice(2);
+			const open =
+				typeof payload.expanded === "boolean" ? payload.expanded : artCollapsed.has(g);
+			if (open) artCollapsed.delete(g);
 			else artCollapsed.add(g);
 			renderArtifactsPanel();
 			return;
 		}
-		if (!p.path) return;
-		const path = String(p.path);
-		if (p.is_dir) {
-			if (expanded.has(path)) expanded.delete(path);
-			else expanded.add(path);
-			renderTreePanel();
+		if (e.event_type !== "select" && e.event_type !== "activate") return;
+		const index = typeof payload.index === "number" ? payload.index : -1;
+		const row = artRows[index];
+		if (!row) return;
+		if ("group" in row) {
+			if (e.event_type === "activate") toggleGroup(row.group);
+			return;
+		}
+		const path = row.path;
+		if (e.event_type === "activate") {
+			lastPreview = path;
+			scheduleOpen(path);
+			diffChain = diffChain.then(() => {
+				editor.floatingPanelControl(PANEL_ID, "blur", 0);
+				if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
+			});
 		} else if (path !== lastPreview) {
 			lastPreview = path;
 			scheduleOpen(path);
 		}
 	});
-
-	// Arrow-key scan: cursor landing on a file line opens it (same preview
-	// feel as the built-in explorer); folders are ignored here — they toggle
-	// only via click or Enter.
-	editor.on("cursor_moved", (args) => {
-		const bid = args?.buffer_id;
-		if (typeof bid !== "number") return;
-		if (bid !== treeBufId && bid !== artifactsBufId) return;
-		const props =
-			Array.isArray(args.text_properties) && args.text_properties.length > 0
-				? args.text_properties
-				: editor.getTextPropertiesAtCursor(bid);
-		const p = props && props.length > 0 ? props[0] : null;
-		if (!p || !p.path || p.is_dir) return;
-		const path = String(p.path);
-		if (path === lastPreview) return;
-		lastPreview = path;
-		scheduleOpen(path);
-	});
-
 	// ── Nested-gitignore filter ──────────────────────────────────────────
 	// A workspace like ~/Desktop/Work holds many independent git repos, each
 	// with its own .gitignore; a test run in one of them sprays ignored churn
 	// (coverage output, __pycache__ leftovers, build artifacts) that the
-	// static EXCLUDE_DIRS list can't anticipate — and it all lands in the
+	// watcher's static exclude list can't anticipate — and it all lands in the
 	// Artifacts panel. Before a queued path becomes an artifact, ask the repo
 	// that CONTAINS it (nearest ancestor dir with a .git, found by walking up
 	// — no startup scan, so repos cloned mid-session work too) whether the
@@ -1052,7 +960,6 @@ fi
 					// mark the artifact entry.
 					closeGoneBuffer(p);
 					dropArtifact(p);
-					scheduleTreeRefresh();
 					if (p === lastPreview) lastPreview = "";
 					continue;
 				}
