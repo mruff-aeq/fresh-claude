@@ -64,20 +64,21 @@
   <rect class="panel" x="1090" y="266" width="400" height="40" rx="4"/>
   <g xml:space="preserve" class="t"><text x="1106" y="292">    demo_screenshot.p<tspan class="good">…</tspan></text></g>
 
-  <text x="1090" y="336" class="note"><tspan class="key">"wrap"</tspan>  (row grows, indent kept)</text>
-  <rect class="panel" x="1090" y="346" width="400" height="68" rx="4"/>
+  <text x="1090" y="336" class="note"><tspan class="key">"wrap"</tspan>  (as many lines as needed, same indent)</text>
+  <rect class="panel" x="1090" y="346" width="400" height="96" rx="4"/>
   <g xml:space="preserve" class="t">
-    <text x="1106" y="372">    demo_screenshot.</text>
-    <text x="1106" y="400">      png                    <tspan class="badge">●</tspan></text>
+    <text x="1106" y="372">    a_very_long_file_name</text>
+    <text x="1106" y="400">    _that_will_not_fit_the</text>
+    <text x="1106" y="428">    _panel.txt          <tspan class="badge">●</tspan></text>
   </g>
 
-  <text x="1090" y="450" class="sub">set in any config layer:</text>
-  <rect class="panel" x="1090" y="460" width="480" height="118" rx="4"/>
+  <text x="1090" y="478" class="sub">set in any config layer:</text>
+  <rect class="panel" x="1090" y="488" width="480" height="118" rx="4"/>
   <g xml:space="preserve" class="code">
-    <text x="1106" y="486"><tspan class="dim">// .fresh/config.json (project)</tspan></text>
-    <text x="1106" y="510">{ "file_explorer": { "overflow": "wrap" } }</text>
-    <text x="1106" y="538"><tspan class="dim">// init.ts (runtime, must re-layout)</tspan></text>
-    <text x="1106" y="562">editor.setSetting("file_explorer.overflow", "wrap")</text>
+    <text x="1106" y="514"><tspan class="dim">// .fresh/config.json (project)</tspan></text>
+    <text x="1106" y="538">{ "file_explorer": { "overflow": "wrap" } }</text>
+    <text x="1106" y="566"><tspan class="dim">// init.ts (runtime, must re-layout)</tspan></text>
+    <text x="1106" y="590">editor.setSetting("file_explorer.overflow", "wrap")</text>
   </g>
 
   <!-- footer -->
