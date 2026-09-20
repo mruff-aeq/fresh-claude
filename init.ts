@@ -13,6 +13,23 @@
 (async () => {
 	if (editor.getEnv("FRESH_PROFILE") !== "claude") return;
 
+	// ── One source of truth for "what changed" ───────────────────────────
+	// The bundled git_gutter plugin paints its own gutter bars and scrollbar
+	// marks (namespaces "git-gutter" / "git-gutter-scroll") from a diff
+	// against git HEAD, re-applied on every open and tab switch. In this
+	// layout the Artifacts entry, the green line overlays and the scrollbar
+	// marks all describe the SAME thing — changes since launch — and HEAD is
+	// a different baseline: a file listed "(+116)" showed orange "modified"
+	// bars and red/orange track marks for hunks nobody touched this session.
+	// Unload it for this profile only (plain `fresh` keeps it); the green
+	// gutter indicators painted in highlightDiff take over the slot.
+	try {
+		if (!(await editor.unloadPlugin("git_gutter")))
+			editor.debug("init.ts: unloadPlugin(git_gutter) refused — HEAD-based gutter marks will show");
+	} catch (e) {
+		editor.debug(`init.ts: unloadPlugin(git_gutter) failed: ${e}`);
+	}
+
 	// ── Session snapshot (highlight baseline) ────────────────────────────
 	// Green highlights diff each file against a launch-time MIRROR of the
 	// workspace, not git HEAD — so highlighting works in any directory, git or
@@ -392,6 +409,20 @@ fi
 	// is replaced atomically per namespace, so each repaint just resends all.
 	const SB_NS = "fresh-claude-diff-sb";
 	const SB_ADD: [number, number, number] = [110, 205, 130];
+	// Gutter bars on added lines — the slot git_gutter used to fill, now fed
+	// from the launch-snapshot diff so gutter, overlay, scrollbar and the
+	// Artifacts "(+N)" always agree. Deleted lines keep their "-" glyph on
+	// the red phantom row. Lines are 0-based here (diff ranges are 1-based).
+	const GUT_NS = "fresh-claude-gutter";
+	const GUT_SYMBOL = "│";
+	function setAddGutter(bufferId: number, ranges: Array<[number, number]>, lineCount: number) {
+		const lines: number[] = [];
+		for (const [a, b] of ranges)
+			for (let ln = a; ln <= Math.min(b, lineCount); ln++) lines.push(ln - 1);
+		editor.clearLineIndicators(bufferId, GUT_NS);
+		if (lines.length)
+			editor.setLineIndicators(bufferId, lines, GUT_NS, GUT_SYMBOL, SB_ADD[0], SB_ADD[1], SB_ADD[2], 100);
+	}
 
 	async function highlightDiff(
 		path: string,
@@ -407,6 +438,7 @@ fi
 		const content = editor.readFile(path);
 		if (content === null) {
 			editor.clearScrollbarMarkers(bufferId, SB_NS);
+			editor.clearLineIndicators(bufferId, GUT_NS);
 			return;
 		}
 		// Both key spellings — the API docs and OverlayOptions disagree.
@@ -435,6 +467,7 @@ fi
 		};
 		if (diff === "all") {
 			if (total > 0) paintLines(1, lines.length);
+			setAddGutter(bufferId, total > 0 ? [[1, lines.length]] : [], lines.length);
 			editor.setScrollbarMarkers(
 				bufferId,
 				SB_NS,
@@ -443,6 +476,7 @@ fi
 			return;
 		}
 		const { adds, dels } = diff;
+		setAddGutter(bufferId, adds, lines.length);
 		if (adds.length === 0 && dels.length === 0) {
 			editor.setScrollbarMarkers(bufferId, SB_NS, []);
 			return;
