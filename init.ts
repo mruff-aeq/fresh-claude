@@ -674,18 +674,24 @@ fi
 	// Second terminal as a TAB next to Terminal 1: the watcher occupies
 	// Terminal 1's foreground, so this one is for actual shell work. The
 	// open_terminal action (what the tab bar "+" runs) creates a terminal
-	// tab directly in the FOCUSED split — no throwaway split needed.
+	// tab directly in the FOCUSED split — no throwaway split needed. It
+	// lands foreground and STAYS there: the empty shell is what the user
+	// types into, the watcher log in Terminal 1 is a tab-click away.
+	let workTermBufferId: number | null = null;
 	{
 		if (shell.splitId !== null) editor.focusSplit(shell.splitId);
 		const bufsBefore = new Set(editor.listBuffers().map((b) => b.id));
 		editor.executeAction("open_terminal");
-		// The new tab lands foreground; give the (queued) buffer updates a
-		// beat, then flip the split back to Terminal 1 for the watcher.
+		// Give the (queued) buffer updates a beat before looking for the tab.
 		await editor.delay(250);
-		if (!editor.listBuffers().some((b) => !bufsBefore.has(b.id)))
-			editor.debug("init.ts: open_terminal produced no Terminal 2 buffer");
-		if (shell.splitId !== null) editor.setSplitBuffer(shell.splitId, shell.bufferId);
+		const born = editor.listBuffers().find((b) => !bufsBefore.has(b.id));
+		if (born) workTermBufferId = born.id;
+		else editor.debug("init.ts: open_terminal produced no Terminal 2 buffer");
 	}
+	// Buffer the bottom split should show by default: Terminal 2 when it
+	// exists, else the watcher shell.
+	const shellFront = () => workTermBufferId ?? shell.bufferId;
+	if (shell.splitId !== null) editor.setSplitBuffer(shell.splitId, shellFront());
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
 
 	// ── Focus indicator: amber active tab ────────────────────────────────
@@ -1078,8 +1084,8 @@ fi
 			.listSplits()
 			.map((s) => s.splitId)
 			.filter((id) => !alive.includes(id));
-		// Put the shell split back on Terminal 1 whatever happened.
-		editor.setSplitBuffer(shell.splitId, shell.bufferId);
+		// Put the shell split back on its work terminal whatever happened.
+		editor.setSplitBuffer(shell.splitId, shellFront());
 		if (born.length !== 1 || noName === undefined) {
 			editor.focusSplit(prevFocus);
 			editor.debug(
