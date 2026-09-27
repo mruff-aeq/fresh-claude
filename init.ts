@@ -117,7 +117,20 @@ fi
 	const MENU_ID = 2; // the right-click menu, mounted on demand
 	const FILES_KEY = "files";
 	const ART_KEY = "artifacts";
-	const FILES_RATIO = 0.5; // the file tree's share of the dock's body rows
+	const FILES_RATIO = 0.5; // default share of the dock's body rows for the file tree
+	// The live share: moved by the ▲ ▼ buttons on the divider row and kept in
+	// a file so a relaunch reopens the dock as it was left.
+	const RATIO_FILE = `${editor.getEnv("XDG_CONFIG_HOME") || `${editor.getEnv("HOME")}/.config`}/fresh-claude/dock-ratio`;
+	let filesRatio = (() => {
+		try {
+			const v = parseFloat(editor.readFile(RATIO_FILE) ?? "");
+			if (v > 0.05 && v < 0.95) return v;
+		} catch (_) {
+			/* default */
+		}
+		return FILES_RATIO;
+	})();
+	const SPLIT_STEP = 3; // rows per ▲ / ▼ click
 	// Dock width: `file_explorer.width` from config when it is an absolute
 	// column count (the old explorer setting keeps working), else 28.
 	const DOCK_COLS = (() => {
@@ -467,21 +480,78 @@ fi
 	// The dock spans the terminal's full height; its body rows (everything
 	// but the two headers and the divider) are split FILES_RATIO to the file
 	// tree. A tree pins the rows it is given and scrolls inside them.
-	const dockHeader = (title: string) => ({
-		kind: "raw",
-		entries: [{ text: ` ${title}`, style: { bold: true } }],
+	// Headers are bare buttons: a click on one puts the keyboard into that
+	// tree (see `hdr:` in the widget_event handler), so Up/Down/Enter work
+	// from the row last clicked without opening or toggling anything.
+	const dockHeader = (title: string, tree: string) => ({
+		kind: "button",
+		label: ` ${title}`,
+		key: `hdr:${tree}`,
+		focused: false,
+		intent: "normal",
+		disabled: false,
+		focusable: false,
+		bare: true,
+		fullWidth: false,
 	});
+	const splitButton = (glyph: string, key: string) => ({
+		kind: "button",
+		label: ` ${glyph} `,
+		key,
+		focused: false,
+		intent: "normal",
+		disabled: false,
+		focusable: false,
+		bare: true,
+		fullWidth: false,
+	});
+	function dockBody(): number {
+		return Math.max(6, editor.getScreenSize().height - 4); // 3 chrome rows + 1 slack
+	}
+	function filesRowCount(): number {
+		const body = dockBody();
+		return Math.min(body - 3, Math.max(3, Math.round(body * filesRatio)));
+	}
+	// ▲ / ▼ on the divider row move the split by SPLIT_STEP rows (the dock
+	// has no host drag handle: a plain divider widget, and no press/drag
+	// events reach a plugin). The new share is written to RATIO_FILE.
+	function moveSplit(delta: number) {
+		const body = dockBody();
+		const rows = Math.min(body - 3, Math.max(3, filesRowCount() + delta));
+		filesRatio = rows / body;
+		try {
+			editor.writeFile(RATIO_FILE, filesRatio.toFixed(3));
+		} catch (e) {
+			editor.debug(`init.ts: could not save dock ratio: ${e}`);
+		}
+		renderDock();
+	}
 	function dockSpec() {
-		const body = Math.max(6, editor.getScreenSize().height - 4); // 3 chrome rows + 1 slack
-		const filesRowsN = Math.max(3, Math.floor(body * FILES_RATIO));
+		const body = dockBody();
+		const filesRowsN = filesRowCount();
 		const artRowsN = Math.max(3, body - filesRowsN);
+		// Divider row: the rule, then ▲ ▼ at its right end.
+		const rule = "─".repeat(Math.max(0, DOCK_INNER - 6));
+		const files = filesSpec(filesRowsN);
+		// A tree shrinks to its nodes; blank rows pad the Files area to its
+		// budget so the divider sits at the ratio even for a small workspace.
+		const pad = Math.max(0, filesRowsN - visible[FILES_KEY].length);
 		return {
 			kind: "col",
 			children: [
-				dockHeader("FILES"),
-				filesSpec(filesRowsN),
-				{ kind: "divider", ch: "─" },
-				dockHeader("ARTIFACTS"),
+				dockHeader("FILES", FILES_KEY),
+				files,
+				...(pad > 0 ? [{ kind: "raw", entries: Array.from({ length: pad }, () => ({ text: "" })) }] : []),
+				{
+					kind: "row",
+					wrap: false,
+					children: [
+						{ kind: "raw", entries: [{ text: rule, style: { fg: "ui.menu_disabled_fg" } }] },
+						splitButton("▲", "split:up"),
+						splitButton("▼", "split:down"),
+					],
+				},
+				dockHeader("ARTIFACTS", ART_KEY),
 				artifactSpec(artRowsN),
 			],
 		};
@@ -533,6 +603,19 @@ fi
 	// `let`: the editor split DIES when its last tab is closed (fresh
 	// collapses an empty split); ensureEditorSplit below rebuilds + reassigns.
 	let editorSplitId: number | undefined = s0?.splitId;
+	// The dock's own keymap, resolved ahead of the active buffer's mode while
+	// the dock holds the keyboard. Needed for Enter: a buffer mode binding
+	// (the bundled markdown plugin binds Enter for list continuation in .md
+	// buffers) otherwise fires first and inserts a newline into the editor
+	// instead of opening the highlighted row.
+	editor.defineMode("fc-dock", [["Return", "fc_dock_enter"]], true, false, true);
+	// A mode binding names a GLOBAL function (the host calls
+	// globalThis[name]); registerCommand is not involved.
+	(globalThis as any).fc_dock_enter = () => {
+		// Act on the tree that holds the keyboard and its highlighted row
+		// directly (the host's own activate carries no row index here).
+		activateRow(focusedTree, hostSel[focusedTree]);
+	};
 	try {
 		// startBlurred: the editor keeps the keyboard; the dock is mouse-first
 		// (click / right-click) and gets focus only when clicked into.
@@ -546,7 +629,7 @@ fi
 			"",
 			false, // closable
 			true, // startBlurred
-			"",
+			"fc-dock",
 		);
 		if (!dockMounted) editor.debug("init.ts: dock mount refused; Files/Artifacts column disabled");
 		else {
@@ -1144,8 +1227,8 @@ fi
 	// `select` (a click's payload is tagged via: "click"), Enter is
 	// `activate`, a right-click is `context` (payload carries the 0-based
 	// screen cell). A CLICK on a file opens it and moves focus to the editor
-	// (so typing goes to the file, not the tree); arrowing onto a file
-	// previews it with the keyboard staying in the dock; Enter commits.
+	// (so typing goes to the file, not the tree); arrow keys only move the
+	// highlight; Enter opens.
 	// Nothing here runs from a scroll — see repaintAfterAutoReload.
 	let lastPreview = "";
 	// Hand the keyboard to the editor pane. After a popup over the dock
@@ -1175,6 +1258,23 @@ fi
 		scheduleOpen(path);
 		diffChain = diffChain.then(() => focusEditorSoon());
 	}
+	let focusedTree = FILES_KEY;
+	const DOUBLE_CLICK_MS = 450;
+	let lastClick: { row: DockRow; at: number } = { row: null, at: 0 };
+	function focusTree(tree: string) {
+		focusedTree = tree;
+		editor.widgetMutate(PANEL_ID, { kind: "setFocusKey", widgetKey: tree });
+		editor.floatingPanelControl(PANEL_ID, "focus", 0);
+	}
+	// Enter / click on a row: a folder or group toggles, a file opens and
+	// hands the keyboard to the editor.
+	function activateRow(tree: string, index: number) {
+		const row = (tree === ART_KEY ? artRows : filesRows)[index];
+		if (!row) return;
+		if ("group" in row) toggleGroup(row.group);
+		else if (row.is_dir) toggleDir(row.path);
+		else openCommitted(row.path);
+	}
 	function toggleDir(path: string) {
 		if (expanded.has(path)) expanded.delete(path);
 		else expanded.add(path);
@@ -1195,15 +1295,40 @@ fi
 	// on MENU_ID (click, or Up/Down + Enter); Esc is `cancel`.
 	let menuTarget: { path: string; is_dir: boolean } | null = null;
 	let menuUp = false;
-	const MENU_ITEMS_FILE: Array<[string, string]> = [
+	type MenuItem = [string, string, ("normal" | "danger")?];
+	const MENU_ITEMS_FILE: MenuItem[] = [
 		["m:open", "Open"],
+		["m:open-default", "Open with default app"],
 		["m:copy", "Copy path"],
+		["m:rename", "Rename…"],
+		["m:duplicate", "Make a copy"],
+		["m:delete", "Delete…", "danger"],
 	];
-	const MENU_ITEMS_DIR: Array<[string, string]> = [["m:copy", "Copy path"]];
-	function menuSpec(target: { path: string; is_dir: boolean }) {
-		const items = target.is_dir ? MENU_ITEMS_DIR : MENU_ITEMS_FILE;
-		let title = relPath(target.path);
-		if (editor.stringWidth(title) > 40) title = `…${title.slice(-39)}`;
+	const MENU_ITEMS_DIR: MenuItem[] = [
+		["m:open-default", "Open in file manager"],
+		["m:copy", "Copy path"],
+		["m:rename", "Rename…"],
+		["m:duplicate", "Make a copy"],
+		["m:delete", "Delete…", "danger"],
+	];
+	const MENU_ITEMS_CONFIRM_DELETE: MenuItem[] = [
+		["m:delete-confirm", "Delete", "danger"],
+		["m:cancel", "Cancel"],
+	];
+	function shortTitle(t: string): string {
+		return editor.stringWidth(t) > 40 ? `…${t.slice(-39)}` : t;
+	}
+	function menuSpec(target: { path: string; is_dir: boolean }, stage: "menu" | "confirm-delete" = "menu") {
+		const items =
+			stage === "confirm-delete"
+				? MENU_ITEMS_CONFIRM_DELETE
+				: target.is_dir
+					? MENU_ITEMS_DIR
+					: MENU_ITEMS_FILE;
+		const title =
+			stage === "confirm-delete"
+				? `Delete ${shortTitle(relPath(target.path))}${target.is_dir ? "/" : ""}?`
+				: shortTitle(relPath(target.path));
 		const w = Math.max(
 			editor.stringWidth(title),
 			...items.map(([, label]) => editor.stringWidth(label)),
@@ -1213,12 +1338,12 @@ fi
 			kind: "col",
 			children: [
 				{ kind: "raw", entries: [{ text: ` ${pad(title)} `, style: { bold: true } }] },
-				...items.map(([key, label]) => ({
+				...items.map(([key, label, intent]) => ({
 					kind: "button",
 					label: ` ${pad(label)} `,
 					key,
 					focused: false,
-					intent: "normal",
+					intent: intent ?? "normal",
 					disabled: false,
 					focusable: true,
 					bare: true,
@@ -1238,9 +1363,11 @@ fi
 	}
 	// `col`/`row`: the right-clicked screen cell (0-based). floatingPanelControl
 	// takes one numeric arg, packed `row << 16 | col`, like the host unpacks.
+	let menuAnchor = { col: 0, row: 0 };
 	function openContextMenu(target: { path: string; is_dir: boolean }, col: number, row: number) {
 		closeMenu();
 		menuTarget = target;
+		menuAnchor = { col, row };
 		// widthPct/heightPct are ignored once anchored (it sizes to content).
 		if (!editor.mountFloatingWidget(MENU_ID, menuSpec(target), 50, 44, false, false, "", false, false, "")) {
 			editor.debug("init.ts: context menu mount refused");
@@ -1268,12 +1395,118 @@ fi
 				break;
 			case "m:copy":
 				editor.copyToClipboard(target.path);
-				editor.setStatus(`Copied path: ${relPath(target.path)}`);
-				focusEditorSoon();
+				afterOp(`Copied path: ${relPath(target.path)}`);
+				break;
+			case "m:open-default":
+				opOpenDefault(target);
+				break;
+			case "m:rename":
+				opRename(target);
+				break;
+			case "m:duplicate":
+				opDuplicate(target);
+				break;
+			case "m:delete":
+				// Second stage: the same popup, now asking for confirmation.
+				menuTarget = target;
+				if (
+					editor.mountFloatingWidget(MENU_ID, menuSpec(target, "confirm-delete"), 50, 44, false, false, "", false, false, "")
+				) {
+					menuUp = true;
+					editor.floatingPanelControl(MENU_ID, "anchor", menuAnchor.row * 65536 + menuAnchor.col);
+					editor.floatingPanelControl(MENU_ID, "focus", 0);
+				}
+				break;
+			case "m:delete-confirm":
+				opDelete(target);
 				break;
 			default:
 				focusEditorSoon();
 		}
+	}
+
+	// ── File operations behind the menu ──────────────────────────────────
+	// All through spawned coreutils (no shell): mv / cp -R / rm -r, and the
+	// platform opener (`open` on macOS, `xdg-open` elsewhere; FRESH_CLAUDE_OPENER
+	// overrides). Delete moves to ~/.Trash when it exists (macOS), else rm -r.
+	// Every op ends by refreshing the tree, dropping stale tabs/artifacts of
+	// the old path, and handing the keyboard back to the editor.
+	const OPENER =
+		editor.getEnv("FRESH_CLAUDE_OPENER") ||
+		(editor.fileExists("/usr/bin/open") ? "open" : "xdg-open");
+	const TRASH_DIR = `${editor.getEnv("HOME")}/.Trash`;
+	const baseOf = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+	const dirOf = (p: string) => p.slice(0, p.lastIndexOf("/"));
+	async function run(cmd: string, args: string[]): Promise<string | null> {
+		try {
+			const r = await editor.spawnProcess(cmd, args, CWD);
+			return r.exit_code === 0 ? null : r.stderr.trim() || `${cmd} exited ${r.exit_code}`;
+		} catch (e) {
+			return String(e);
+		}
+	}
+	function forgetPath(path: string) {
+		closeGoneBuffer(path);
+		dropArtifact(path);
+		if (path === lastPreview) lastPreview = "";
+	}
+	// Status is set AFTER the focus handoff: the focus_editor action inside
+	// it writes its own "Editor focused" status, which would bury ours.
+	async function afterOp(msg: string) {
+		scheduleDockRefresh();
+		await focusEditorSoon();
+		editor.setStatus(msg);
+	}
+	async function opOpenDefault(t: { path: string; is_dir: boolean }) {
+		const err = await run(OPENER, [t.path]);
+		afterOp(err === null ? `Opened ${relPath(t.path)} with ${OPENER}` : `Open failed: ${err}`);
+	}
+	async function opRename(t: { path: string; is_dir: boolean }) {
+		const name = await editor.prompt(`Rename ${baseOf(t.path)} to:`, baseOf(t.path));
+		if (name === null || name === "" || name === baseOf(t.path)) return focusEditorSoon();
+		if (name.includes("/")) return afterOp("Rename: name cannot contain '/'");
+		const dst = `${dirOf(t.path)}/${name}`;
+		if (editor.fileExists(dst)) return afterOp(`Rename: ${name} already exists`);
+		const err = await run("mv", ["--", t.path, dst]);
+		if (err !== null) return afterOp(`Rename failed: ${err}`);
+		forgetPath(t.path);
+		if (t.is_dir) {
+			// Keep the renamed dir (and its expanded subdirs) open.
+			for (const d of [...expanded])
+				if (d === t.path || d.startsWith(`${t.path}/`)) {
+					expanded.delete(d);
+					expanded.add(dst + d.slice(t.path.length));
+				}
+		}
+		afterOp(`Renamed to ${relPath(dst)}`);
+	}
+	// Finder-style copy names: "name copy.ext", then "name copy 2.ext", …
+	function copyNameFor(path: string): string {
+		const base = baseOf(path);
+		const dot = base.startsWith(".") ? -1 : base.lastIndexOf(".");
+		const stem = dot > 0 ? base.slice(0, dot) : base;
+		const ext = dot > 0 ? base.slice(dot) : "";
+		for (let n = 1; ; n++) {
+			const cand = `${dirOf(path)}/${stem} copy${n > 1 ? ` ${n}` : ""}${ext}`;
+			if (!editor.fileExists(cand)) return cand;
+		}
+	}
+	async function opDuplicate(t: { path: string; is_dir: boolean }) {
+		const dst = copyNameFor(t.path);
+		const err = await run("cp", ["-R", "--", t.path, dst]);
+		afterOp(err === null ? `Copied to ${relPath(dst)}` : `Copy failed: ${err}`);
+	}
+	async function opDelete(t: { path: string; is_dir: boolean }) {
+		let err: string | null;
+		if (editor.fileExists(TRASH_DIR)) {
+			let dst = `${TRASH_DIR}/${baseOf(t.path)}`;
+			if (editor.fileExists(dst)) dst += ` ${Date.now()}`;
+			err = await run("mv", ["--", t.path, dst]);
+		} else err = await run("rm", ["-r", "--", t.path]);
+		if (err !== null) return afterOp(`Delete failed: ${err}`);
+		forgetPath(t.path);
+		if (t.is_dir) for (const d of [...expanded]) if (d === t.path || d.startsWith(`${t.path}/`)) expanded.delete(d);
+		afterOp(`Deleted ${relPath(t.path)}${editor.fileExists(TRASH_DIR) ? " (moved to Trash)" : ""}`);
 	}
 
 	editor.on("widget_event", (e) => {
@@ -1282,6 +1515,17 @@ fi
 			return;
 		}
 		if (e.panel_id !== PANEL_ID) return;
+		// Header click: hand the keyboard to that tree. Its selection (the
+		// row last clicked or arrowed to) is where Up/Down continue from.
+		if (e.event_type === "activate" && e.widget_key.startsWith("hdr:")) {
+			focusTree(e.widget_key.slice(4));
+			return;
+		}
+		// Divider buttons: ▲ gives rows to Artifacts, ▼ to the file tree.
+		if (e.event_type === "activate" && e.widget_key.startsWith("split:")) {
+			moveSplit(e.widget_key === "split:up" ? -SPLIT_STEP : SPLIT_STEP);
+			return;
+		}
 		const payload = (e.payload ?? {}) as {
 			index?: unknown;
 			key?: unknown;
@@ -1324,13 +1568,16 @@ fi
 		const row = rows[index];
 		const clicked = payload.via === "click";
 		if (e.event_type === "select") {
-			// The host swallows a right-click on the tree's SELECTED row (no
-			// context event at all). Mouse users right-click next, so a click
-			// drops the host selection; keyboard navigation keeps it (Up/Down
-			// continue from it) and the whole-entry highlight marks the row.
-			hostSel[tree] = clicked ? -1 : index;
-			if (clicked)
-				editor.widgetMutate(PANEL_ID, { kind: "setSelectedIndex", widgetKey: tree, index: -1 });
+			// The host's selection follows every select, click or keyboard, so
+			// Up/Down continue from the row last clicked. (Host quirk: a
+			// right-click on the SELECTED row emits no context event at all —
+			// the menu for that row needs a click elsewhere first.)
+			hostSel[tree] = index;
+			// A keyboard select can arrive while the panel has no focused
+			// widget (Up/Down reach the tree as smart keys, Enter would not):
+			// make the tree the focused widget so Enter opens the row.
+			if (!clicked) focusTree(tree);
+			else focusedTree = tree;
 			if (!sameRow(hilite[tree], row)) {
 				hilite[tree] = row;
 				renderDock();
@@ -1344,23 +1591,21 @@ fi
 			openContextMenu(row, col, r);
 			return;
 		}
-		// Click or Enter on a folder toggles it; on a file opens it and hands
-		// the keyboard to the editor. Arrowing onto a file previews it (focus
-		// stays in the dock).
-		const commit = e.event_type === "activate" || clicked;
-		if ("group" in row) {
-			if (commit) toggleGroup(row.group);
+		// A single click on a file only selects it (keyboard stays in the
+		// dock, arrows continue from it); a DOUBLE click or Enter opens. A
+		// click on a folder or group toggles it right away. Arrowing onto a
+		// row only moves the highlight.
+		if (e.event_type === "activate") {
+			activateRow(tree, index);
 			return;
 		}
-		if (row.is_dir) {
-			if (commit) toggleDir(row.path);
-			return;
-		}
-		if (commit) openCommitted(row.path);
-		else if (row.path !== lastPreview) {
-			lastPreview = row.path;
-			scheduleOpen(row.path);
-		}
+		if (!clicked) return;
+		const now = Date.now();
+		const isFile = "path" in row && !row.is_dir;
+		const double = isFile && sameRow(lastClick.row, row) && now - lastClick.at <= DOUBLE_CLICK_MS;
+		lastClick = { row, at: double ? 0 : now };
+		if (!isFile || double) activateRow(tree, index);
+		else focusTree(tree);
 	});
 	// ── Hover: light every row of the entry under the pointer ────────────
 	// The host paints a hover band on the one row under the mouse; a wrapped
@@ -1370,16 +1615,17 @@ fi
 	// scrolling and reports no offset (dock wheel events never reach a
 	// plugin), so a tree that overflows its budget keeps the host's one-row
 	// hover alone. Layout, top to bottom: FILES header, the file tree's rows
-	// (as many as it shows), divider, ARTIFACTS header, the artifacts rows.
+	// padded to its budget, divider, ARTIFACTS header, the artifacts rows.
 	function hoverTargetAt(column: number, row: number): { tree: string; row: DockRow } | null {
 		if (column < 0 || column >= DOCK_INNER || row < 1) return null;
 		const filesVis = visible[FILES_KEY];
 		const filesShown = Math.min(filesVis.length, budget[FILES_KEY]);
-		if (row <= filesShown) {
+		if (row <= budget[FILES_KEY]) {
+			if (row > filesShown) return null; // padding rows
 			if (filesVis.length > budget[FILES_KEY]) return null; // scrollable: offset unknown
 			return { tree: FILES_KEY, row: filesRows[filesVis[row - 1]] ?? null };
 		}
-		const artTop = filesShown + 3; // divider + header
+		const artTop = budget[FILES_KEY] + 3; // divider + header
 		const artVis = visible[ART_KEY];
 		const i = row - artTop;
 		if (i < 0 || i >= Math.min(artVis.length, budget[ART_KEY])) return null;
