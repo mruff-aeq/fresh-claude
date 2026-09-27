@@ -6,14 +6,14 @@ Claude Code IDE layout for [fresh](https://getfresh.dev) terminal editor. One co
 
 ```
 ┌──────────┬──────────────────────────┬──────────────────────┐
-│ File     │  editor (tabs)           │  Claude Code         │
-│ Explorer │                          │  (full height)       │
+│ Files    │  editor (tabs)           │  Claude Code         │
+│          │                          │  (full height)       │
 ├──────────┤                          │                      │
 │ Artifacts├──────────────────────────┤                      │
 │          │  shell                   │                      │
 └──────────┴──────────────────────────┴──────────────────────┘
 
-Left column = fresh's own sidebar: built-in **File Explorer** on top, **Artifacts** section under it (sidebar-sections API, fresh ≥ 0.5.0).
+Left column = one plugin dock (fresh ≥ 0.5.0): own **Files** tree on top, **Artifacts** under it. fresh's built-in File Explorer not used.
 ```
 
 ## How work
@@ -22,7 +22,8 @@ Left column = fresh's own sidebar: built-in **File Explorer** on top, **Artifact
 - Click entry → file open in editor, changed lines **green**, jump to first change. Enter = open + focus editor. Scrollbar show green/red marks where changes live. Group header `▼` = fold/unfold.
 - Delete file → entry gone, tab gone. Revert file → entry gone. No clutter.
 - No tab spam — nothing opens until you click.
-- Changed files also get green `●` badge in File Explorer (folders inherit). Open from explorer → same green overlays. Test-runner temp churn filtered out.
+- **Files** tree: click a file = open + focus editor (type right away); click a folder = fold/unfold; arrow keys = preview. Long names **wrap** onto extra rows (no truncation), continuation rows start with a dim `↳`; hover or click lights the whole name (all its rows) while the tree fits its rows unscrolled. Changed files show green `●`. Test-runner temp churn filtered out.
+- **Right-click** any file row (Files or Artifacts) → context menu: **Open**, **Copy path** (absolute path → clipboard). Dir rows: Copy path. Arrow keys + Enter work in the menu, Esc closes.
 - Green baseline = snapshot when fresh-claude start. Works in any dir, git not needed.
 - Gutter bars + scrollbar marks come from the SAME snapshot diff (green = added, red = deleted). Bundled `git_gutter` plugin (diffs vs git HEAD: orange/red/green) is unloaded in this profile only, so gutter, overlay, scrollbar and Artifacts `(+N)` always agree. Plain `fresh` keeps it.
 - `git checkout` / `pull` / `stash` / `reset` mid-session → rewritten files NOT listed; baseline moves with them, so only edits after the switch show. Needs the repo's reflog (plain dirs unaffected).
@@ -54,7 +55,7 @@ Plain `fresh` untouched — layout only wakes when wrapper sets `FRESH_PROFILE=c
 
 ## Tune
 
-Constants at top of `~/.config/fresh/init.ts`: pane ratios (`CLAUDE_RATIO`, `SHELL_RATIO`), Artifacts rows (`ART_ROWS`), colors (`DIFF_BG`, `DIR_STYLE`, `FILE_STYLE`, `ART_DOT`). Explorer width/hidden files in `.fresh/config.json` (`file_explorer`). Snapshot skip-list in `SNAP_SCRIPT`. Watcher knobs in `bin/fresh-watch-open`. Code is law — read the source.
+Constants at top of `~/.config/fresh/init.ts`: pane ratios (`CLAUDE_RATIO`, `SHELL_RATIO`, `FILES_RATIO` = Files/Artifacts split), colors (`DIFF_BG`, `DIR_STYLE`, `FILE_STYLE`, `ART_DOT`), skipped dirs (`EXCLUDE_DIRS`), menu items (`MENU_ITEMS_FILE`, `MENU_ITEMS_DIR`). Dock width = `file_explorer.width` in `.fresh/config.json` when absolute (`"28"`), else 28. Snapshot skip-list in `SNAP_SCRIPT`. Watcher knobs in `bin/fresh-watch-open`. Code is law — read the source.
 
 ## Uninstall
 

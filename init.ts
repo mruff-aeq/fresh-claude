@@ -2,13 +2,15 @@
 // Only active when launched via the fresh-claude wrapper (FRESH_PROFILE=claude);
 // plain `fresh` is untouched. Installed to ~/.config/fresh/init.ts.
 //
-// Layout: [explorer + Artifacts sidebar] | editor (+ shell below) | Claude Code right.
-// The left column is fresh's own sidebar: the built-in file explorer on top
-// and an "Artifacts" section below it (mountSidebarSection, fresh ≥ 0.5.0 —
-// sinelaw/fresh#3045) listing every file changed since launch. Changed files
-// are BROADCAST to the Artifacts section (and badged ● in the explorer)
-// instead of auto-opening as tabs; clicking (or pressing Enter on) an entry
-// opens the file in the editor pane with changed lines highlighted green.
+// Layout: [Files + Artifacts dock] | editor (+ shell below) | Claude Code right.
+// The left column is a plugin dock (mountFloatingWidget asDock, fresh ≥ 0.5.0)
+// holding two trees: the workspace file tree (long names wrap) and an
+// "Artifacts" list of every file changed since launch. fresh's built-in File
+// Explorer is not used. Changed files are BROADCAST to Artifacts (and marked ●
+// in the file tree) instead of auto-opening as tabs; clicking (or pressing
+// Enter on) an entry opens the file in the editor pane with changed lines
+// highlighted green. Right-click on any row opens a context menu (Open, Copy
+// path).
 
 (async () => {
 	if (editor.getEnv("FRESH_PROFILE") !== "claude") return;
@@ -85,37 +87,254 @@ fi
 	}
 
 	// Dir rows and file rows get distinct theme-key colors (resolved against
-	// the active theme) in BOTH panels, so the type is readable at a glance:
+	// the active theme) in both trees, so the type is readable at a glance:
 	// dirs bold keyword-color, files string-color.
-	// Dir rows and file rows get distinct theme-key colors (resolved against
-	// the active theme), so the type is readable at a glance: dirs bold
-	// keyword-color, files string-color.
 	const DIR_STYLE = { fg: "syntax.keyword", bold: true };
 	const FILE_STYLE = { fg: "syntax.string" };
 	// Deletion accents — shared by the in-file red phantom lines and the
 	// Artifacts "-N" spans. DEL_BG is DIFF_BG's red twin.
 	const DEL_BG: [number, number, number] = [86, 28, 28];
 	const DEL_ACCENT: [number, number, number] = [220, 90, 90];
-	// Explorer badge for changed files — the scrollbar's add-marker green. It
-	// outranks the bundled git badges: "changed since launch" is this
-	// layout's own notion of dirty, and the slot holds one glyph.
+	// Changed-file color in the file tree (● + name) — the scrollbar's
+	// add-marker green: "changed since launch" is this layout's own notion of
+	// dirty.
 	const ART_DOT: [number, number, number] = [110, 205, 130];
 
-	// ── Artifacts sidebar section ────────────────────────────────────────
-	// One tree widget mounted as a collapsible section UNDER the built-in
-	// file explorer. Rows: one header per directory (workspace-relative, "./"
-	// for the root), newest-touched group first, newest file first within a
-	// group. Group expansion is plugin-owned: the widget's expandedKeys is
-	// initial-only, so it is re-pushed (setExpandedKeys) after every content
-	// update. The host keys panels per plugin, so a constant id suffices.
-	const PANEL_ID = 1;
-	const TREE_KEY = "artifacts";
-	const ART_ROWS = 0; // 0 = share the column with the explorer
-	const ART_NS = "fresh-claude-artifacts"; // explorer decoration namespace
+	// ── Files + Artifacts dock ───────────────────────────────────────────
+	// The left column is a plugin DOCK (mountFloatingWidget asDock, fresh ≥
+	// 0.5.0): ONE panel holding two tree widgets — the workspace file tree on
+	// top, the Artifacts list under it. fresh's own sidebar (the built-in
+	// File Explorer) is not used: in 0.5.1 it cannot be hidden or collapsed
+	// on its own (toggle_file_explorer hides the whole column, plugin sections
+	// included; the header's collapse toggle is mouse-only and not
+	// persisted), and it hard-truncates long names. Both trees here WRAP a
+	// long name instead: the tree widget has no per-node wrapping (item
+	// height is uniform), so a name wider than its row continues on extra
+	// leaf rows that resolve to the same path. Right-click on any row opens
+	// a context menu (the host fires widget_event "context" for it). The host
+	// keys panels per plugin, so constant ids suffice.
+	const PANEL_ID = 1; // the dock
+	const MENU_ID = 2; // the right-click menu, mounted on demand
+	const FILES_KEY = "files";
+	const ART_KEY = "artifacts";
+	const FILES_RATIO = 0.5; // the file tree's share of the dock's body rows
+	// Dock width: `file_explorer.width` from config when it is an absolute
+	// column count (the old explorer setting keeps working), else 28.
+	const DOCK_COLS = (() => {
+		try {
+			const w = (editor.getConfig() as any)?.file_explorer?.width;
+			if (typeof w === "string" && /^\d+$/.test(w)) return Math.max(16, parseInt(w, 10));
+		} catch (_) {
+			/* fall through to the default */
+		}
+		return 28;
+	})();
+	// Content columns: the host paints the dock's right border in the last
+	// column. A tree row spends 2 columns on the disclosure glyph (or the
+	// blank standing in for one) plus its indent; the rest is text.
+	const DOCK_INNER = DOCK_COLS - 1;
+	const FILES_INDENT = 2;
+	const ART_INDENT = 1;
+	// Marker at the start of every continuation row of a wrapped name, so a
+	// row that belongs to the entry above reads as such at a glance (its
+	// hits — click, right-click — still resolve to that entry).
+	const WRAP_GLYPH = "↳ ";
+	const WRAP_W = editor.stringWidth(WRAP_GLYPH);
+	const WRAP_GLYPH_STYLE = { fg: "ui.menu_disabled_fg" };
+	// Prefix the continuation chunks (all but the first) with the marker,
+	// dimmed via an inline overlay (byte offsets).
+	function markContinuations(chunks: string[]): Array<{ text: string; inlineOverlays?: unknown[] }> {
+		return chunks.map((c, i) =>
+			i === 0
+				? { text: c }
+				: {
+						text: WRAP_GLYPH + c,
+						inlineOverlays: [
+							{ start: 0, end: editor.utf8ByteLength(WRAP_GLYPH.trimEnd()), style: WRAP_GLYPH_STYLE },
+						],
+					},
+		);
+	}
+	// Directories the file tree never lists (same set the snapshot skips).
+	const EXCLUDE_DIRS = new Set([
+		".git",
+		"node_modules",
+		".venv",
+		"venv",
+		"dist",
+		"build",
+		"coverage",
+		"__pycache__",
+		".pytest_cache",
+		".nuxt",
+		".output",
+	]);
+	// Dirs the snapshot mirror skips (SNAP_SCRIPT's --exclude list): files
+	// under them have no baseline and get no highlights.
+	const SNAP_EXCLUDE = new Set([...EXCLUDE_DIRS, ".fresh"]);
+
+	// Split `text` into chunks no wider than `cols` terminal columns
+	// (stringWidth counts wide glyphs like ● correctly). Never empty.
+	// `restCols` (default `cols`) is the budget of the continuation rows,
+	// for when they sit one indent level deeper than the first.
+	function wrapCols(text: string, cols: number, restCols: number = cols): string[] {
+		cols = Math.max(4, cols);
+		restCols = Math.max(4, restCols);
+		if (editor.stringWidth(text) <= cols) return [text];
+		const out: string[] = [];
+		let cur = "";
+		for (const ch of text) {
+			const budget = out.length === 0 ? cols : restCols;
+			if (cur !== "" && editor.stringWidth(cur + ch) > budget) {
+				out.push(cur);
+				cur = ch;
+			} else cur += ch;
+		}
+		if (cur !== "") out.push(cur);
+		return out;
+	}
+
+	// What a tree row stands for. Each tree keeps an array parallel to its
+	// nodes (widget_event reports an index over ALL of a tree's nodes,
+	// collapsed ones included); continuation rows of a wrapped name map to
+	// the same entry as the row they continue.
+	type DockRow = { path: string; is_dir: boolean } | { group: string } | null;
+	let filesRows: DockRow[] = [];
+	let artRows: DockRow[] = [];
+	// The entry the user last landed on, per tree, painted with HILITE_BG on
+	// EVERY row it spans (a wrapped name is one entry, so the whole name
+	// lights up — the host's own bar would mark a single row). The host's
+	// selectedIndex is mirrored in `hostSel` so a spec re-publish (which
+	// happens on every highlight change) does not reset keyboard navigation;
+	// it is -1 after a mouse click (see the select handler).
+	// HILITE_BG is the very color the host paints its one-row hover band
+	// with, so the plugin's whole-entry band and the host's row band read as
+	// one highlight.
+	const HILITE_BG = "ui.menu_hover_bg";
+	const hilite: Record<string, DockRow> = { [FILES_KEY]: null, [ART_KEY]: null };
+	// The entry under the mouse pointer (see the mouse_move handler), painted
+	// the same way so hovering a wrapped name lights every row of it.
+	const hover: Record<string, DockRow> = { [FILES_KEY]: null, [ART_KEY]: null };
+	const hostSel: Record<string, number> = { [FILES_KEY]: -1, [ART_KEY]: -1 };
+	// Node indices in display order of the rows the host actually shows
+	// (children of a collapsed dir/group are skipped), per tree — what maps a
+	// screen row back to an entry while the tree is not scrolled.
+	const visible: Record<string, number[]> = { [FILES_KEY]: [], [ART_KEY]: [] };
+	const budget: Record<string, number> = { [FILES_KEY]: 0, [ART_KEY]: 0 };
+	function sameRow(a: DockRow, b: DockRow): boolean {
+		if (a === null || b === null) return false;
+		if ("group" in a) return "group" in b && a.group === b.group;
+		return "path" in b && a.path === b.path;
+	}
+	function rowStyle(base: Record<string, unknown>, tree: string, row: DockRow) {
+		return sameRow(hilite[tree], row) || sameRow(hover[tree], row) ? { ...base, bg: HILITE_BG } : base;
+	}
+	// Directory listings are cached across the hover-driven re-renders
+	// (pointer crossing rows) and dropped on every content-driven one.
+	let dirCache = new Map<string, DirEntry[]>();
+	function readDirCached(dir: string): DirEntry[] {
+		let entries = dirCache.get(dir);
+		if (entries === undefined) {
+			entries = editor.readDir(dir);
+			dirCache.set(dir, entries);
+		}
+		return entries;
+	}
+
+	// ── File tree ────────────────────────────────────────────────────────
+	// Dirs are read lazily — only expanded ones are listed (root always is),
+	// so big trees stay cheap. Files changed since launch are painted in the
+	// Artifacts green with a ● in front, the dock's equivalent of the old
+	// explorer badge.
+	const expanded = new Set<string>([CWD]);
+	function expandedDirKeys(): string[] {
+		return [...expanded].filter((d) => d !== CWD).map((d) => `d:${d}`);
+	}
+	function filesSpec(visibleRows: number) {
+		const nodes: Array<Record<string, unknown>> = [];
+		const keys: string[] = [];
+		filesRows = [];
+		const vis: number[] = [];
+		const push = (node: Record<string, unknown>, key: string, row: DockRow, shown = true) => {
+			if (shown) vis.push(nodes.length);
+			nodes.push(node);
+			keys.push(key);
+			filesRows.push(row);
+		};
+		const walk = (dir: string, depth: number) => {
+			let entries: DirEntry[];
+			try {
+				entries = readDirCached(dir);
+			} catch (e) {
+				editor.debug(`init.ts: readDir(${dir}) failed: ${e}`);
+				return;
+			}
+			entries = entries.filter((en) => !(en.is_dir && EXCLUDE_DIRS.has(en.name)));
+			entries.sort((a, b) =>
+				a.is_dir !== b.is_dir
+					? a.is_dir
+						? -1
+						: 1
+					: a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }),
+			);
+			const cols = DOCK_INNER - 2 - depth * FILES_INDENT;
+			for (const en of entries) {
+				const full = `${dir}/${en.name}`;
+				const row: DockRow = { path: full, is_dir: en.is_dir };
+				const changed = !en.is_dir && artifacts.has(full);
+				const style = rowStyle(en.is_dir ? DIR_STYLE : changed ? { fg: ART_DOT } : FILE_STYLE, FILES_KEY, row);
+				const chunks = markContinuations(
+					en.is_dir
+						? wrapCols(`${en.name}/`, cols, cols - FILES_INDENT - WRAP_W)
+						: wrapCols(`${changed ? "● " : ""}${en.name}`, cols, cols - WRAP_W),
+				);
+				push(
+					{ text: { ...chunks[0], style }, depth, hasChildren: en.is_dir },
+					`${en.is_dir ? "d" : "f"}:${full}`,
+					row,
+				);
+				// The host nests by depth: rows deeper than a hasChildren row are
+				// its children (hidden while it is collapsed). A file's
+				// continuation rows sit at its own depth as plain siblings; a
+				// dir's must be its first children, so they fold with it —
+				// while collapsed the dir shows its first chunk with the host's
+				// `…`.
+				const contDepth = en.is_dir ? depth + 1 : depth;
+				for (let i = 1; i < chunks.length; i++)
+					push(
+						{ text: { ...chunks[i], style }, depth: contDepth, hasChildren: false },
+						`c:${full}#${i}`,
+						row,
+						!en.is_dir || expanded.has(full),
+					);
+				if (en.is_dir && expanded.has(full)) walk(full, depth + 1);
+			}
+		};
+		walk(CWD, 0);
+		if (nodes.length === 0) push({ text: { text: "(empty)" }, depth: 0, hasChildren: false }, "empty", null);
+		visible[FILES_KEY] = vis;
+		budget[FILES_KEY] = visibleRows;
+		return {
+			kind: "tree",
+			key: FILES_KEY,
+			nodes,
+			itemKeys: keys,
+			selectedIndex: hostSel[FILES_KEY],
+			visibleRows,
+			expandedKeys: expandedDirKeys(),
+			checkable: false,
+			itemHeight: 1,
+			cardBorders: false,
+			indentCols: FILES_INDENT,
+		};
+	}
+
+	// ── Artifacts tree ───────────────────────────────────────────────────
+	// One header per directory (workspace-relative, "./" for the root),
+	// newest-touched group first, newest file first within a group. Group
+	// expansion is plugin-owned: the widget's expandedKeys is initial-only,
+	// so it is re-pushed (setExpandedKeys) after every content update.
 	const artCollapsed = new Set<string>();
-	// Node index → what the row stands for, parallel to the spec's nodes
-	// (widget_event reports an index over ALL nodes, collapsed ones included).
-	let artRows: Array<{ group: string } | { path: string } | null> = [];
 
 	function artifactTag(a: any): string {
 		return a.status === "new"
@@ -129,15 +348,19 @@ fi
 						.join(" ");
 	}
 
-	function artifactSpec() {
+	function artifactSpec(visibleRows: number) {
 		const nodes: Array<Record<string, unknown>> = [];
 		const keys: string[] = [];
 		artRows = [];
-		if (artifacts.size === 0) {
-			nodes.push({ text: { text: "(no changes yet)" }, depth: 0, hasChildren: false });
-			keys.push("empty");
-			artRows.push(null);
-		}
+		const vis: number[] = [];
+		const push = (node: Record<string, unknown>, key: string, row: DockRow, shown = true) => {
+			if (shown) vis.push(nodes.length);
+			nodes.push(node);
+			keys.push(key);
+			artRows.push(row);
+		};
+		if (artifacts.size === 0)
+			push({ text: { text: "(no changes yet)" }, depth: 0, hasChildren: false }, "empty", null);
 		// dir → items newest-first; Map keeps first-seen (= newest) group order.
 		const groups = new Map<string, Array<{ path: string; a: any }>>();
 		for (const [path, a] of [...artifacts.entries()].reverse()) {
@@ -149,51 +372,84 @@ fi
 			items.push({ path, a });
 		}
 		for (const [dir, items] of groups) {
-			nodes.push({
-				text: { text: `${dir}  (${items.length})`, style: DIR_STYLE },
-				depth: 0,
-				hasChildren: true,
-			});
-			keys.push(`g:${dir}`);
-			artRows.push({ group: dir });
+			const gcols = DOCK_INNER - 2;
+			const gchunks = markContinuations(
+				wrapCols(`${dir}  (${items.length})`, gcols, gcols - ART_INDENT - WRAP_W),
+			);
+			const gstyle = rowStyle(DIR_STYLE, ART_KEY, { group: dir });
+			push(
+				{ text: { ...gchunks[0], style: gstyle }, depth: 0, hasChildren: true },
+				`g:${dir}`,
+				{ group: dir },
+			);
+			const open = !artCollapsed.has(dir);
+			for (let i = 1; i < gchunks.length; i++)
+				push(
+					{ text: { ...gchunks[i], style: gstyle }, depth: 1, hasChildren: false },
+					`c:g:${dir}#${i}`,
+					{ group: dir },
+					open,
+				);
+			const cols = DOCK_INNER - 2 - ART_INDENT;
 			for (const { path, a } of items) {
 				const name = dir === "./" ? relPath(path) : relPath(path).slice(dir.length);
-				const head = `● ${name}  (`;
-				const text: Record<string, unknown> = {
-					text: `${head}${artifactTag(a)})`,
-					style: FILE_STYLE,
-				};
-				// Red accent on the "-N" span, matching the in-file deletion
-				// marker. Offsets in BYTES (the InlineOverlay default unit)
-				// via utf8ByteLength — char units miscount the wide ● glyph.
-				// The host shifts them past the indent/disclosure prefix.
-				if (a.deleted && a.status === "modified") {
-					const addPart = a.added ? `+${a.added} ` : "";
-					const start = editor.utf8ByteLength(`${head}${addPart}`);
-					text.inlineOverlays = [
-						{
-							start,
-							end: start + editor.utf8ByteLength(`-${a.deleted}`),
-							style: { fg: DEL_ACCENT },
-						},
-					];
+				const tag = `  (${artifactTag(a)})`;
+				// Wrap the name; the tag rides on the last chunk, or on a chunk
+				// of its own when it does not fit there.
+				const chunks = wrapCols(`● ${name}`, cols, cols - WRAP_W);
+				for (let i = 1; i < chunks.length; i++) chunks[i] = WRAP_GLYPH + chunks[i];
+				let last = chunks[chunks.length - 1];
+				if (editor.stringWidth(last + tag) <= cols) chunks[chunks.length - 1] = last + tag;
+				else chunks.push(WRAP_GLYPH + tag);
+				last = chunks[chunks.length - 1];
+				const row: DockRow = { path, is_dir: false };
+				const style = rowStyle(FILE_STYLE, ART_KEY, row);
+				for (let i = 0; i < chunks.length; i++) {
+					const text: Record<string, unknown> = { text: chunks[i], style };
+					if (i > 0)
+						text.inlineOverlays = [
+							{ start: 0, end: editor.utf8ByteLength(WRAP_GLYPH.trimEnd()), style: WRAP_GLYPH_STYLE },
+						];
+					// Red accent on the "-N" span, matching the in-file deletion
+					// marker. Offsets in BYTES (the InlineOverlay default unit)
+					// via utf8ByteLength — char units miscount the wide ● glyph.
+					// The host shifts them past the indent/disclosure prefix.
+					if (i === chunks.length - 1 && a.deleted && a.status === "modified") {
+						const addPart = a.added ? `+${a.added} ` : "";
+						const head = last.slice(0, last.length - tag.length) + `  (${addPart}`;
+						const start = editor.utf8ByteLength(head);
+						text.inlineOverlays = [
+							...((text.inlineOverlays as unknown[] | undefined) ?? []),
+							{
+								start,
+								end: start + editor.utf8ByteLength(`-${a.deleted}`),
+								style: { fg: DEL_ACCENT },
+							},
+						];
+					}
+					push(
+						{ text, depth: 1, hasChildren: false },
+						i === 0 ? `a:${path}` : `c:a:${path}#${i}`,
+						row,
+						open,
+					);
 				}
-				nodes.push({ text, depth: 1, hasChildren: false });
-				keys.push(`f:${path}`);
-				artRows.push({ path });
 			}
 		}
+		visible[ART_KEY] = vis;
+		budget[ART_KEY] = visibleRows;
 		return {
 			kind: "tree",
-			key: TREE_KEY,
+			key: ART_KEY,
 			nodes,
 			itemKeys: keys,
-			selectedIndex: -1,
+			selectedIndex: hostSel[ART_KEY],
+			visibleRows,
 			expandedKeys: expandedGroupKeys(),
 			checkable: false,
 			itemHeight: 1,
 			cardBorders: false,
-			indentCols: 1,
+			indentCols: ART_INDENT,
 		};
 	}
 
@@ -211,61 +467,109 @@ fi
 		return out;
 	}
 
-	let artMounted = false;
-	function pushArtExpanded() {
-		if (!artMounted) return;
+	// ── Dock assembly ────────────────────────────────────────────────────
+	// The dock spans the terminal's full height; its body rows (everything
+	// but the two headers and the divider) are split FILES_RATIO to the file
+	// tree. A tree pins the rows it is given and scrolls inside them.
+	const dockHeader = (title: string) => ({
+		kind: "raw",
+		entries: [{ text: ` ${title}`, style: { bold: true } }],
+	});
+	function dockSpec() {
+		const body = Math.max(6, editor.getScreenSize().height - 4); // 3 chrome rows + 1 slack
+		const filesRowsN = Math.max(3, Math.floor(body * FILES_RATIO));
+		const artRowsN = Math.max(3, body - filesRowsN);
+		return {
+			kind: "col",
+			children: [
+				dockHeader("FILES"),
+				filesSpec(filesRowsN),
+				{ kind: "divider", ch: "─" },
+				dockHeader("ARTIFACTS"),
+				artifactSpec(artRowsN),
+			],
+		};
+	}
+
+	let dockMounted = false;
+	function pushExpanded() {
+		if (!dockMounted) return;
 		editor.widgetMutate(PANEL_ID, {
 			kind: "setExpandedKeys",
-			widgetKey: TREE_KEY,
+			widgetKey: FILES_KEY,
+			keys: expandedDirKeys(),
+		});
+		editor.widgetMutate(PANEL_ID, {
+			kind: "setExpandedKeys",
+			widgetKey: ART_KEY,
 			keys: expandedGroupKeys(),
 		});
 	}
-
-	// Re-publish the section and the explorer badges from `artifacts`.
-	function renderArtifactsPanel() {
+	// Re-publish the whole dock. A collapse/expand goes through here too, not
+	// just a setExpandedKeys mutation: fresh 0.5.1 tracks the new state either
+	// way (arrow keys skip the hidden rows) but only repaints when the spec is
+	// replaced. Both trees are rebuilt (the file tree's ● badges come from
+	// `artifacts`); expanded dirs are re-read, which is cheap.
+	function renderDock(hoverOnly = false) {
+		if (!dockMounted) return;
+		if (!hoverOnly) dirCache = new Map();
 		try {
-			editor.setFileExplorerDecorations(
-				ART_NS,
-				[...artifacts.keys()].map((path) => ({
-					path,
-					symbol: "●",
-					color: ART_DOT,
-					priority: 100, // above git_explorer's M/A badges
-
-				})),
-			);
+			editor.updateFloatingWidget(PANEL_ID, dockSpec());
+			pushExpanded();
 		} catch (e) {
-			editor.debug(`init.ts: explorer decorations failed: ${e}`);
+			editor.debug(`init.ts: dock render failed: ${e}`);
 		}
-		if (!artMounted) return;
-		editor.updateFloatingWidget(PANEL_ID, artifactSpec());
-		pushArtExpanded();
+	}
+	function renderArtifactsPanel() {
+		renderDock();
+	}
+	// Debounced refresh for disk churn the tree must reflect but that changes
+	// no artifact (files created/deleted, new dirs): one re-read per burst.
+	let dockRefreshPending = false;
+	function scheduleDockRefresh() {
+		if (dockRefreshPending || !dockMounted) return;
+		dockRefreshPending = true;
+		(async () => {
+			await editor.delay(500);
+			dockRefreshPending = false;
+			renderDock();
+		})();
 	}
 
-	// The startup split is the editor pane; the sidebar is chrome, not a
-	// split, so nothing here changes the split tree.
+	// The startup split is the editor pane; the dock is chrome, not a split,
+	// so mounting it changes nothing in the split tree.
 	const s0 = editor.listSplits()[0];
 	// `let`: the editor split DIES when its last tab is closed (fresh
 	// collapses an empty split); ensureEditorSplit below rebuilds + reassigns.
 	let editorSplitId: number | undefined = s0?.splitId;
 	try {
-		// A FOCUSED mount reveals the sidebar column (explorer included) even
-		// when the last session left it hidden — a blurred mount is silent
-		// (Editor::reveal_sidebar). Mount focused, then hand the keyboard
-		// straight back to the editor pane.
-		artMounted = editor.mountSidebarSection(PANEL_ID, artifactSpec(), "Artifacts", ART_ROWS, {
-			closable: false,
-			startBlurred: false,
-		});
-		if (!artMounted) editor.debug("init.ts: mountSidebarSection refused; Artifacts section disabled");
+		// startBlurred: the editor keeps the keyboard; the dock is mouse-first
+		// (click / right-click) and gets focus only when clicked into.
+		dockMounted = editor.mountFloatingWidget(
+			PANEL_ID,
+			dockSpec(),
+			60,
+			40,
+			true, // asDock
+			false, // focusMarker
+			"",
+			false, // closable
+			true, // startBlurred
+			"",
+		);
+		if (!dockMounted) editor.debug("init.ts: dock mount refused; Files/Artifacts column disabled");
 		else {
-			pushArtExpanded();
-			editor.floatingPanelControl(PANEL_ID, "blur", 0);
+			editor.floatingPanelControl(PANEL_ID, "dock", DOCK_COLS);
+			pushExpanded();
 		}
 	} catch (e) {
-		editor.debug(`init.ts: Artifacts section creation failed: ${e}`);
+		editor.debug(`init.ts: dock creation failed: ${e}`);
 	}
+	// Terminal resize: re-split the body rows. (User-driven — never fires on
+	// scroll.)
+	editor.on("resize", () => renderDock());
 	if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
+
 	// Right pane, full height of the editor region: Claude Code spawned
 	// directly in the PTY. Full path via FRESH_CLAUDE_BIN (set by
 	// fresh-claude) — the PTY child skips the login shell, so PATH may not
@@ -352,10 +656,15 @@ fi
 		| "all"
 		| null
 	> {
+		if (typeof path !== "string") return null;
 		const snap = snapPathOf(path);
 		if (snap === null) return null;
+		// Under a dir the snapshot skips (.git, node_modules, .fresh, …) there
+		// is no baseline by design — that is "unknown", not "all new".
+		if (path.slice(CWD.length + 1).split("/").some((seg) => SNAP_EXCLUDE.has(seg))) return null;
 		const content = editor.readFile(path);
-		if (content === null) return null;
+		// null = unreadable; a binary file comes back undefined (not a string).
+		if (typeof content !== "string") return null;
 		// Size cap first, so a >1 MB file (absent from the mirror) is skipped
 		// rather than painted whole via the "all" branch below.
 		if (editor.utf8ByteLength(content) > MAX_BYTES) return null;
@@ -838,63 +1147,267 @@ fi
 			.catch((e) => editor.debug(`init.ts: open+highlight failed: ${e}`));
 	}
 
-	// ── Section activation ───────────────────────────────────────────────
-	// The host routes every hit on the Artifacts tree through widget_event:
-	// a disclosure-glyph click is `expand`, Up/Down/click on a row is `select`
-	// (a click's payload is tagged via: "click"), Enter is `activate`. A row
-	// select PREVIEWS the file (keyboard stays in the sidebar, like the
-	// explorer's single-click); Enter opens it and moves focus to the editor.
+	// ── Dock interaction ─────────────────────────────────────────────────
+	// The host routes every hit on the dock's trees through widget_event: a
+	// disclosure-glyph click is `expand`, Up/Down or a click on a row is
+	// `select` (a click's payload is tagged via: "click"), Enter is
+	// `activate`, a right-click is `context` (payload carries the 0-based
+	// screen cell). A CLICK on a file opens it and moves focus to the editor
+	// (so typing goes to the file, not the tree); arrowing onto a file
+	// previews it with the keyboard staying in the dock; Enter commits.
 	// Nothing here runs from a scroll — see repaintAfterAutoReload.
 	let lastPreview = "";
-	// A collapse/expand is re-PUBLISHED (updateFloatingWidget), not just
-	// pushed as a setExpandedKeys mutation: fresh 0.5.1 tracks the new state
-	// either way (arrow keys skip the hidden rows) but only repaints the
-	// section when its spec is replaced, so a bare mutation leaves the
-	// collapsed children visible until the next content update.
+	// Hand the keyboard to the editor pane. After a popup over the dock
+	// closes, the host puts the layout tree's key focus back on the dock's
+	// tree (log: "key routed by the tree … focus=#widget_focus:files") while
+	// the dock itself reads as blurred — so a plain blur is a no-op and
+	// typing dies in the tree (neither focus_editor nor toggle_dock_focus
+	// moves it either, verified on 0.5.1). Making the dock properly focused
+	// first, a beat later blurring it, walks the same path a click into the
+	// dock and out again takes, and that one does release the keys.
+	async function focusEditor() {
+		editor.floatingPanelControl(PANEL_ID, "focus", 0);
+		await editor.delay(200);
+		editor.widgetMutate(PANEL_ID, { kind: "setFocusKey", widgetKey: "" });
+		editor.floatingPanelControl(PANEL_ID, "blur", 0);
+		if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
+		editor.executeAction("focus_editor");
+	}
+	// Command dispatch is budgeted across frames: give the popup's unmount a
+	// beat to land before the focus dance above.
+	async function focusEditorSoon() {
+		await editor.delay(250);
+		await focusEditor();
+	}
+	function openCommitted(path: string) {
+		lastPreview = path;
+		scheduleOpen(path);
+		diffChain = diffChain.then(() => focusEditorSoon());
+	}
+	function toggleDir(path: string) {
+		if (expanded.has(path)) expanded.delete(path);
+		else expanded.add(path);
+		renderDock();
+	}
 	function toggleGroup(g: string) {
 		if (artCollapsed.has(g)) artCollapsed.delete(g);
 		else artCollapsed.add(g);
-		renderArtifactsPanel();
+		renderDock();
 	}
+
+	// ── Right-click context menu ─────────────────────────────────────────
+	// A content-sized popup anchored at the clicked cell (the recipe fresh's
+	// bundled orchestrator dock uses): a `col` of bare buttons, every label
+	// padded to the widest so the host frames a uniform box that hugs its
+	// rows. Intrinsic-width content only — a fullWidth widget in here would
+	// stretch the popup to half the screen. Actions come back as `activate`
+	// on MENU_ID (click, or Up/Down + Enter); Esc is `cancel`.
+	let menuTarget: { path: string; is_dir: boolean } | null = null;
+	let menuUp = false;
+	const MENU_ITEMS_FILE: Array<[string, string]> = [
+		["m:open", "Open"],
+		["m:copy", "Copy path"],
+	];
+	const MENU_ITEMS_DIR: Array<[string, string]> = [["m:copy", "Copy path"]];
+	function menuSpec(target: { path: string; is_dir: boolean }) {
+		const items = target.is_dir ? MENU_ITEMS_DIR : MENU_ITEMS_FILE;
+		let title = relPath(target.path);
+		if (editor.stringWidth(title) > 40) title = `…${title.slice(-39)}`;
+		const w = Math.max(
+			editor.stringWidth(title),
+			...items.map(([, label]) => editor.stringWidth(label)),
+		);
+		const pad = (s: string) => `${s}${" ".repeat(Math.max(0, w - editor.stringWidth(s)))}`;
+		return {
+			kind: "col",
+			children: [
+				{ kind: "raw", entries: [{ text: ` ${pad(title)} `, style: { bold: true } }] },
+				...items.map(([key, label]) => ({
+					kind: "button",
+					label: ` ${pad(label)} `,
+					key,
+					focused: false,
+					intent: "normal",
+					disabled: false,
+					focusable: true,
+					bare: true,
+					fullWidth: false,
+				})),
+				{
+					kind: "raw",
+					entries: [{ text: ` ${pad("Esc closes")} `, style: { fg: "ui.menu_disabled_fg" } }],
+				},
+			],
+		};
+	}
+	function closeMenu() {
+		if (!menuUp) return;
+		menuUp = false;
+		editor.unmountFloatingWidget(MENU_ID);
+	}
+	// `col`/`row`: the right-clicked screen cell (0-based). floatingPanelControl
+	// takes one numeric arg, packed `row << 16 | col`, like the host unpacks.
+	function openContextMenu(target: { path: string; is_dir: boolean }, col: number, row: number) {
+		closeMenu();
+		menuTarget = target;
+		// widthPct/heightPct are ignored once anchored (it sizes to content).
+		if (!editor.mountFloatingWidget(MENU_ID, menuSpec(target), 50, 44, false, false, "", false, false, "")) {
+			editor.debug("init.ts: context menu mount refused");
+			return;
+		}
+		menuUp = true;
+		editor.floatingPanelControl(MENU_ID, "anchor", Math.max(0, row) * 65536 + Math.max(0, col));
+		// A popup raised from a BLURRED dock does not take the keyboard by
+		// itself — Enter would land in the editor. Focus it explicitly so
+		// Up/Down/Enter/Esc drive the menu.
+		editor.floatingPanelControl(MENU_ID, "focus", 0);
+	}
+	function onMenuEvent(e: { event_type: string; widget_key: string }) {
+		if (e.event_type === "cancel") {
+			closeMenu();
+			focusEditorSoon();
+			return;
+		}
+		if (e.event_type !== "activate" || menuTarget === null) return;
+		const target = menuTarget;
+		closeMenu();
+		switch (e.widget_key) {
+			case "m:open":
+				openCommitted(target.path);
+				break;
+			case "m:copy":
+				editor.copyToClipboard(target.path);
+				editor.setStatus(`Copied path: ${relPath(target.path)}`);
+				focusEditorSoon();
+				break;
+			default:
+				focusEditorSoon();
+		}
+	}
+
 	editor.on("widget_event", (e) => {
+		if (e.panel_id === MENU_ID) {
+			onMenuEvent(e);
+			return;
+		}
 		if (e.panel_id !== PANEL_ID) return;
 		const payload = (e.payload ?? {}) as {
 			index?: unknown;
 			key?: unknown;
 			expanded?: unknown;
 			via?: unknown;
+			list_key?: unknown;
+			col?: unknown;
+			row?: unknown;
 		};
+		// The tree a hit belongs to: its key rides in widget_key; a mouse hit
+		// on a row may name the item instead and carry the tree in list_key.
+		const key = typeof payload.key === "string" ? payload.key : e.widget_key;
+		const tree =
+			e.widget_key === FILES_KEY || e.widget_key === ART_KEY
+				? e.widget_key
+				: typeof payload.list_key === "string"
+					? payload.list_key
+					: key.startsWith("a:") || key.startsWith("g:") || key.startsWith("c:a:") || key.startsWith("c:g:")
+						? ART_KEY
+						: FILES_KEY;
+		const rows = tree === ART_KEY ? artRows : filesRows;
 		if (e.event_type === "expand") {
-			if (typeof payload.key !== "string" || !payload.key.startsWith("g:")) return;
-			const g = payload.key.slice(2);
-			const open =
-				typeof payload.expanded === "boolean" ? payload.expanded : artCollapsed.has(g);
-			if (open) artCollapsed.delete(g);
-			else artCollapsed.add(g);
-			renderArtifactsPanel();
+			if (key.startsWith("d:")) {
+				const d = key.slice(2);
+				const open = typeof payload.expanded === "boolean" ? payload.expanded : !expanded.has(d);
+				if (open) expanded.add(d);
+				else expanded.delete(d);
+				renderDock();
+			} else if (key.startsWith("g:")) {
+				const g = key.slice(2);
+				const open = typeof payload.expanded === "boolean" ? payload.expanded : artCollapsed.has(g);
+				if (open) artCollapsed.delete(g);
+				else artCollapsed.add(g);
+				renderDock();
+			}
 			return;
 		}
-		if (e.event_type !== "select" && e.event_type !== "activate") return;
+		if (e.event_type !== "select" && e.event_type !== "activate" && e.event_type !== "context") return;
 		const index = typeof payload.index === "number" ? payload.index : -1;
-		const row = artRows[index];
+		const row = rows[index];
+		const clicked = payload.via === "click";
+		if (e.event_type === "select") {
+			// The host swallows a right-click on the tree's SELECTED row (no
+			// context event at all). Mouse users right-click next, so a click
+			// drops the host selection; keyboard navigation keeps it (Up/Down
+			// continue from it) and the whole-entry highlight marks the row.
+			hostSel[tree] = clicked ? -1 : index;
+			if (clicked)
+				editor.widgetMutate(PANEL_ID, { kind: "setSelectedIndex", widgetKey: tree, index: -1 });
+			if (!sameRow(hilite[tree], row)) {
+				hilite[tree] = row;
+				renderDock();
+			}
+		}
 		if (!row) return;
-		if ("group" in row) {
-			if (e.event_type === "activate") toggleGroup(row.group);
+		if (e.event_type === "context") {
+			if ("group" in row) return;
+			const col = typeof payload.col === "number" ? payload.col : 0;
+			const r = typeof payload.row === "number" ? payload.row : 0;
+			openContextMenu(row, col, r);
 			return;
 		}
-		const path = row.path;
-		if (e.event_type === "activate") {
-			lastPreview = path;
-			scheduleOpen(path);
-			diffChain = diffChain.then(() => {
-				editor.floatingPanelControl(PANEL_ID, "blur", 0);
-				if (editorSplitId !== undefined) editor.focusSplit(editorSplitId);
-			});
-		} else if (path !== lastPreview) {
-			lastPreview = path;
-			scheduleOpen(path);
+		// Click or Enter on a folder toggles it; on a file opens it and hands
+		// the keyboard to the editor. Arrowing onto a file previews it (focus
+		// stays in the dock).
+		const commit = e.event_type === "activate" || clicked;
+		if ("group" in row) {
+			if (commit) toggleGroup(row.group);
+			return;
+		}
+		if (row.is_dir) {
+			if (commit) toggleDir(row.path);
+			return;
+		}
+		if (commit) openCommitted(row.path);
+		else if (row.path !== lastPreview) {
+			lastPreview = row.path;
+			scheduleOpen(row.path);
 		}
 	});
+	// ── Hover: light every row of the entry under the pointer ────────────
+	// The host paints a hover band on the one row under the mouse; a wrapped
+	// name spans several rows, so mouse_move (screen cell, 0-based) is mapped
+	// back to the entry and its other rows get the same band from here. The
+	// map is exact only while a tree shows all its rows: the host owns tree
+	// scrolling and reports no offset (dock wheel events never reach a
+	// plugin), so a tree that overflows its budget keeps the host's one-row
+	// hover alone. Layout, top to bottom: FILES header, the file tree's rows
+	// (as many as it shows), divider, ARTIFACTS header, the artifacts rows.
+	function hoverTargetAt(column: number, row: number): { tree: string; row: DockRow } | null {
+		if (column < 0 || column >= DOCK_INNER || row < 1) return null;
+		const filesVis = visible[FILES_KEY];
+		const filesShown = Math.min(filesVis.length, budget[FILES_KEY]);
+		if (row <= filesShown) {
+			if (filesVis.length > budget[FILES_KEY]) return null; // scrollable: offset unknown
+			return { tree: FILES_KEY, row: filesRows[filesVis[row - 1]] ?? null };
+		}
+		const artTop = filesShown + 3; // divider + header
+		const artVis = visible[ART_KEY];
+		const i = row - artTop;
+		if (i < 0 || i >= Math.min(artVis.length, budget[ART_KEY])) return null;
+		if (artVis.length > budget[ART_KEY]) return null;
+		return { tree: ART_KEY, row: artRows[artVis[i]] ?? null };
+	}
+	editor.on("mouse_move", (m) => {
+		if (!dockMounted || menuUp) return;
+		const target = hoverTargetAt(m.column, m.row);
+		let changed = false;
+		for (const tree of [FILES_KEY, ART_KEY]) {
+			const next = target !== null && target.tree === tree ? target.row : null;
+			if (next === hover[tree] || sameRow(next, hover[tree])) continue;
+			hover[tree] = next;
+			changed = true;
+		}
+		if (changed) renderDock(true);
+	});
+
 	// ── Nested-gitignore filter ──────────────────────────────────────────
 	// A workspace like ~/Desktop/Work holds many independent git repos, each
 	// with its own .gitignore; a test run in one of them sprays ignored churn
@@ -1112,6 +1625,7 @@ done
 				live.push(p);
 			}
 			if (live.length === 0 && gone.length === 0) return;
+			scheduleDockRefresh(); // created/deleted paths reshape the file tree
 			// An edited .gitignore changes verdicts — drop the cache and let
 			// the next burst re-ask git.
 			if (live.some((p) => p.endsWith("/.gitignore"))) ignoredCache.clear();
