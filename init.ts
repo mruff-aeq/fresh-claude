@@ -247,9 +247,6 @@ fi
 	// Artifacts green with a ● in front, the dock's equivalent of the old
 	// explorer badge.
 	const expanded = new Set<string>([CWD]);
-	function expandedDirKeys(): string[] {
-		return [...expanded].filter((d) => d !== CWD).map((d) => `d:${d}`);
-	}
 	function filesSpec(visibleRows: number) {
 		const nodes: Array<Record<string, unknown>> = [];
 		const keys: string[] = [];
@@ -283,31 +280,30 @@ fi
 				const row: DockRow = { path: full, is_dir: en.is_dir };
 				const changed = !en.is_dir && artifacts.has(full);
 				const style = rowStyle(en.is_dir ? DIR_STYLE : changed ? { fg: ART_DOT } : FILE_STYLE, FILES_KEY, row);
-				const chunks = markContinuations(
-					en.is_dir
-						? wrapCols(`${en.name}/`, cols, cols - FILES_INDENT - WRAP_W)
-						: wrapCols(`${changed ? "● " : ""}${en.name}`, cols, cols - WRAP_W),
-				);
+				const open = en.is_dir && expanded.has(full);
+				// Dirs draw their own disclosure glyph as part of the text and are
+				// plain leaves to the host: the host reserves its glyph column on
+				// EVERY row anyway (leaves included), so a host-drawn glyph would
+				// push dir names two columns right of file names at the same
+				// depth. With the glyph in the text, `▶ docs/` and `.env` start
+				// in the same column. Folding needs no host help — a collapsed
+				// dir's children are simply not listed.
+				const label = en.is_dir
+					? `${open ? "▼" : "▶"} ${en.name}/`
+					: `${changed ? "● " : ""}${en.name}`;
+				const chunks = markContinuations(wrapCols(label, cols, cols - WRAP_W));
 				push(
-					{ text: { ...chunks[0], style }, depth, hasChildren: en.is_dir },
+					{ text: { ...chunks[0], style }, depth, hasChildren: false },
 					`${en.is_dir ? "d" : "f"}:${full}`,
 					row,
 				);
-				// The host nests by depth: rows deeper than a hasChildren row are
-				// its children (hidden while it is collapsed). A file's
-				// continuation rows sit at its own depth as plain siblings; a
-				// dir's must be its first children, so they fold with it —
-				// while collapsed the dir shows its first chunk with the host's
-				// `…`.
-				const contDepth = en.is_dir ? depth + 1 : depth;
 				for (let i = 1; i < chunks.length; i++)
 					push(
-						{ text: { ...chunks[i], style }, depth: contDepth, hasChildren: false },
+						{ text: { ...chunks[i], style }, depth, hasChildren: false },
 						`c:${full}#${i}`,
 						row,
-						!en.is_dir || expanded.has(full),
 					);
-				if (en.is_dir && expanded.has(full)) walk(full, depth + 1);
+				if (open) walk(full, depth + 1);
 			}
 		};
 		walk(CWD, 0);
@@ -321,7 +317,7 @@ fi
 			itemKeys: keys,
 			selectedIndex: hostSel[FILES_KEY],
 			visibleRows,
-			expandedKeys: expandedDirKeys(),
+			expandedKeys: [], // folding is plugin-owned (see the dir rows above)
 			checkable: false,
 			itemHeight: 1,
 			cardBorders: false,
@@ -494,11 +490,6 @@ fi
 	let dockMounted = false;
 	function pushExpanded() {
 		if (!dockMounted) return;
-		editor.widgetMutate(PANEL_ID, {
-			kind: "setExpandedKeys",
-			widgetKey: FILES_KEY,
-			keys: expandedDirKeys(),
-		});
 		editor.widgetMutate(PANEL_ID, {
 			kind: "setExpandedKeys",
 			widgetKey: ART_KEY,
